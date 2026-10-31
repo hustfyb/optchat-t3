@@ -27,7 +27,7 @@ for (const name of ['work', 'personal']) {
 rememberProfile('personal');
 
 /** A headless Pi (print or RPC) whose model answers "OK to: <prompt>" and records what each call was sent. */
-async function headless(mode: 'print' | 'rpc', options: { flag?: string; bound?: string; connect?: string; agent?: string; hold?: Promise<void>; later?: ExtensionFactory;
+async function headless(mode: 'print' | 'rpc' | 'tui', options: { flag?: string; bound?: string; connect?: string; agent?: string; hold?: Promise<void>; later?: ExtensionFactory;
   /** A host that runs `--no-session`: Pi keeps no file and hands out a throwaway id. */ ephemeral?: boolean; sessionId?: string } = {}) {
   const dir = mkdtempSync(join(root, 's-'));
   const sent: string[] = [], errors: string[] = [];
@@ -244,6 +244,18 @@ test('--optchat-profile auto with --no-session creates no profile and runs as pl
     } finally { await pi.close(); }
   }
   assert.deepEqual(listProfiles(), before, 'no profile was created for the throwaway session');
+});
+
+test('--optchat-profile auto still refuses a --no-session session in the TUI, and opens nothing', async () => {
+  const before = listProfiles();
+  const pi = await headless('tui', { flag: 'auto', ephemeral: true });
+  try {
+    assert.deepEqual(pi.errors, [], 'the refusal is shown to the person, not thrown out of the handler');
+    assert.match(pi.notes.at(-1) ?? '', /--optchat-profile auto needs a session: this host started Pi with --no-session/,
+      'the person is told why their flag did nothing');
+    assert.deepEqual(pi.bindings(), [], 'nothing is bound');
+    assert.deepEqual(listProfiles(), before, 'no profile is created');
+  } finally { await pi.close(); }
 });
 
 test('--optchat-profile auto leaves a session that is already bound to its own profile alone', async () => {

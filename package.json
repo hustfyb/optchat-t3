@@ -1,6 +1,6 @@
 {
-  "name": "pi-optchat",
-  "version": "0.11.0",
+  "name": "optchat-t3",
+  "version": "0.11.1-t3.1",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
@@ -56,24 +56,26 @@
       "optional": true
     }
   },
-  "description": "OptChat memory for Pi: persistent profiles, zoomable history, background agents, and conversation imports.",
+  "description": "OptChat memory for Pi, with per-session profiles for T3 Code (fork of pi-optchat).",
   "keywords": [
     "pi-package",
     "pi-extension",
     "optchat",
     "uniichat",
     "memory",
-    "subagents"
+    "subagents",
+    "t3-code",
+    "t3"
   ],
   "author": "Jonas",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonaslsaa/pi-optchat.git"
+    "url": "git+https://github.com/hustfyb/optchat-t3.git"
   },
-  "homepage": "https://github.com/jonaslsaa/pi-optchat#readme",
+  "homepage": "https://github.com/hustfyb/optchat-t3#readme",
   "bugs": {
-    "url": "https://github.com/jonaslsaa/pi-optchat/issues"
+    "url": "https://github.com/hustfyb/optchat-t3/issues"
   },
   "engines": {
     "node": ">=22.19.0"

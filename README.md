@@ -1,6 +1,10 @@
 ![Pi-OptChat: persistent memory for Pi](https://raw.githubusercontent.com/jonaslsaa/pi-optchat/main/docs/banner.jpg)
 
-# pi-optchat
+# optchat-t3
+
+> **Fork of [pi-optchat](https://github.com/jonaslsaa/pi-optchat).** It adds per-session profiles for
+> [T3 Code](docs/t3-code.md) (`--optchat-profile auto`) and the fix for T3 replacing the session under a
+> running extension. Everything else is upstream 0.11.0.
 
 A Pi extension that gives you one endless chat per profile, remembered through a summary tree instead of compaction. It implements [Victor Taelin's OptChat recipe](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
 
@@ -15,9 +19,12 @@ It runs inside ordinary Pi, with no fork or separate launcher.
 ## Install
 
 ```sh
-pi install npm:pi-optchat
+pi install git:github.com/hustfyb/optchat-t3
 pi install npm:pi-web-access   # optional, for web search and page fetching
 ```
+
+Using T3 Code? Point its Pi provider at this extension with `--optchat-profile auto`; see
+[docs/t3-code.md](docs/t3-code.md). Upstream's `pi install npm:pi-optchat` is the original package.
 
 Or from GitHub: `pi install git:github.com/jonaslsaa/pi-optchat`.
 

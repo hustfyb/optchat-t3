@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, writeSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { hostname } from 'node:os';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -220,6 +220,16 @@ export default function optchat(pi: ExtensionAPI) {
     if (!name) return undefined;
     createProfile(name); return name;
   };
+  // `--optchat-profile auto` names a profile after the session, for hosts that run many sessions in one
+  // process and cannot set a profile per thread (T3 Code). The session id keeps the name stable across
+  // resumes; the directory keeps it readable. It is created on first use with the model the session runs.
+  const autoProfile = (ctx: ExtensionContext) => {
+    const session = ctx.sessionManager.getSessionId();
+    const id = typeof session === 'string' ? session.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase() : '';
+    if (id.length < 6) return undefined;
+    const slug = basename(ctx.cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
+    return `t3-${slug}-${id}`;
+  };
   const openProfile = async (name: string, ctx: ExtensionContext) => {
     const dir = profilePath(name);
     if (!existsSync(dir)) throw new Error(`Profile ${name} does not exist. Use /optchat profile to create it.`);
@@ -289,14 +299,16 @@ export default function optchat(pi: ExtensionAPI) {
     // A session with conversation in it belongs to its profile. One that is only bound (a fresh `/optchat profile` session) may still pick another.
     const settled = boundName !== undefined && entries.some(e => e.type === 'message' || e.type === 'custom_message');
     const flag = pi.getFlag('optchat-profile');
+    // `auto` is not a profile name: the session names its own profile.
+    const auto = flag === 'auto';
     try {
-      if (boundName && typeof flag === 'string' && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
+      if (boundName && typeof flag === 'string' && !auto && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
       const agentId = pi.getFlag('optchat-agent');
       if (agentId !== undefined) {
         if (typeof agentId !== 'string' || !agentId.trim()) throw new Error('--optchat-agent requires an exact agent ID');
         if (ctx.mode !== 'tui') { process.exitCode = 1; throw new Error('--optchat-agent requires interactive Pi (not print, JSON or RPC mode)'); }
         if (settled) throw new Error('This session already contains a main conversation. Open the agent in a fresh Pi session.');
-        const name = boundName ?? (typeof flag === 'string' ? flag : undefined);
+        const name = boundName ?? (typeof flag === 'string' && !auto ? flag : undefined);
         if (!name) throw new Error('--optchat-agent needs a profile: pass --optchat-profile');
         remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text), agentId);
         fault = undefined;
@@ -304,7 +316,15 @@ export default function optchat(pi: ExtensionAPI) {
         for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
         return;
       }
-      let name = boundName ?? (typeof flag === 'string' ? flag : await chooseProfile(ctx));
+      let name = boundName ?? (auto ? autoProfile(ctx) : typeof flag === 'string' ? flag : await chooseProfile(ctx));
+      if (auto && !boundName) {
+        if (!name) throw new Error('--optchat-profile auto needs a session: this host started Pi with --no-session.');
+        if (!existsSync(profilePath(name))) {
+          createProfile(name);
+          const model = mainChoice(ctx);
+          if (model) saveConfig(profilePath(name), { ...loadConfig(profilePath(name)), compactor: model, subagent: model });
+        }
+      }
       // Only plain `pi -p` joins: JSON and RPC output carry Pi's own events, which a joined reply would bypass.
       const connect = ctx.mode === 'print' ? connectMode() : 'off';
       if (connect === 'join' && !name) { process.exitCode = 1; throw new Error('--optchat-connect join needs a profile: pass --optchat-profile'); }

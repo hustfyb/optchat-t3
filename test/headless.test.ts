@@ -191,3 +191,31 @@ test('--optchat-agent refuses headless mode without opening a profile or answeri
     } finally { await pi.close(); process.exitCode = undefined; }
   }
 });
+
+test('--optchat-profile auto names the profile after the session and creates it from the session model', async () => {
+  const pi = await headless('rpc', { flag: 'auto' });
+  try {
+    assert.match(await pi.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the prompt runs with the OptChat view');
+    const [binding, ...rest] = pi.bindings();
+    assert.equal(rest.length, 0, 'one binding');
+    assert.match(String((binding as { name?: string } | undefined)?.name), /^t3-s-[a-z0-9]+-[a-z0-9]{6,8}$/,
+      'the name is the directory slug plus the session id');
+    const name = (binding as { name: string }).name, dir = profilePath(name);
+    assert.ok(existsSync(join(dir, 'AGENTS.md')), 'the profile is complete, so /optchat instructions works');
+    const config = loadConfig(dir);
+    assert.deepEqual({ provider: config.compactor.provider, model: config.compactor.model }, { provider: 'fixture', model: 'fixture' },
+      'the compactor runs the model the session already uses');
+    assert.deepEqual({ provider: config.subagent.provider, model: config.subagent.model }, { provider: 'fixture', model: 'fixture' });
+    assert.equal(config.compactor.thinking, config.subagent.thinking, 'thinking follows the session');
+    assert.deepEqual(pi.errors, []);
+  } finally { await pi.close(); }
+});
+
+test('--optchat-profile auto leaves a session that is already bound to its own profile alone', async () => {
+  const pi = await headless('rpc', { flag: 'auto', bound: 'work' });
+  try {
+    await pi.ask('Say OK');
+    assert.deepEqual(pi.bindings(), [{ name: 'work' }], 'the saved binding wins over auto');
+    assert.ok(!existsSync(profilePath('auto')), 'auto is not treated as a profile name');
+  } finally { await pi.close(); }
+});

@@ -1,12 +1,13 @@
-import { after, test } from 'node:test';
+import { after, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import fs, { existsSync, mkdtempSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
-import { createProfile, lastProfile, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, listProfiles } from '../src/profiles.ts';
+import { autoProfileName, createProfile, defaults, lastProfile, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, listProfiles } from '../src/profiles.ts';
 import { textContent } from '../src/transcript.ts';
 import { emptyUsage } from '../src/usage.ts';
 import { removeDir } from './support.ts';
@@ -28,8 +29,8 @@ rememberProfile('personal');
 
 /** A headless Pi (print or RPC) whose model answers "OK to: <prompt>" and records what each call was sent. */
 async function headless(mode: 'print' | 'rpc' | 'tui', options: { flag?: string; bound?: string; connect?: string; agent?: string; hold?: Promise<void>; later?: ExtensionFactory;
-  /** A host that runs `--no-session`: Pi keeps no file and hands out a throwaway id. */ ephemeral?: boolean; sessionId?: string } = {}) {
-  const dir = mkdtempSync(join(root, 's-'));
+  /** A host that runs `--no-session`: Pi keeps no file and hands out a throwaway id. */ ephemeral?: boolean; sessionId?: string; cwd?: string } = {}) {
+  const dir = options.cwd ?? mkdtempSync(join(root, 's-'));
   const sent: string[] = [], errors: string[] = [];
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models.json'), refreshOnCreate: false });
   runtime.registerProvider('fixture', {
@@ -244,6 +245,27 @@ test('--optchat-profile auto with --no-session creates no profile and runs as pl
     } finally { await pi.close(); }
   }
   assert.deepEqual(listProfiles(), before, 'no profile was created for the throwaway session');
+});
+
+test('a profile another host creates during startup surfaces as its lock owner, not as EEXIST', async () => {
+  const dir = mkdtempSync(join(root, 'race-')), id = '01a19227-2f21-7c00-8000-000000000001';
+  const name = autoProfileName(dir, id)!, target = profilePath(name);
+  createProfile(name);
+  const unlock = await lockProfile(target, `${name} · PID 1 · elsewhere`);
+  const original = fs.existsSync, seen = { n: 0 };
+  // The first two checks are startup's guard and createProfile's own: both see no directory, as they would while two
+  // hosts race. Afterwards the directory is visible, as it is once the other host's mkdir has returned.
+  mock.method(fs, 'existsSync', (path: fs.PathLike) => String(path) === target && seen.n++ < 2 ? false : original(path));
+  syncBuiltinESMExports();
+  const pi = await headless('rpc', { flag: 'auto', sessionId: id, cwd: dir });
+  try {
+    assert.equal(pi.errors.length, 1, 'the session start fails once');
+    assert.match(String(pi.errors[0]), /Profile already running: .*PID 1/, 'the message names the host that holds the profile');
+    assert.doesNotMatch(String(pi.errors[0]), /EEXIST/, 'a raced mkdir is not reported as a filesystem error');
+    assert.deepEqual(loadConfig(target).compactor, defaults.compactor, 'the other host keeps the config it wrote');
+  } finally {
+    await pi.close(); mock.restoreAll(); syncBuiltinESMExports(); await unlock(); removeDir(target); removeDir(dir);
+  }
 });
 
 test('--optchat-profile auto still refuses a --no-session session in the TUI, and opens nothing', async () => {

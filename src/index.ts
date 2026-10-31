@@ -323,9 +323,15 @@ export default function optchat(pi: ExtensionAPI) {
         if (!name && ctx.mode !== 'tui') { status(ctx); return; }
         if (!name) throw new Error('--optchat-profile auto needs a session: this host started Pi with --no-session.');
         if (!existsSync(profilePath(name))) {
-          createProfile(name);
-          const model = mainChoice(ctx);
-          if (model) saveConfig(profilePath(name), { ...loadConfig(profilePath(name)), compactor: model, subagent: model });
+          try {
+            createProfile(name);
+            const model = mainChoice(ctx);
+            if (model) saveConfig(profilePath(name), { ...loadConfig(profilePath(name)), compactor: model, subagent: model });
+          } catch (error) {
+            // Another host can create the profile between the check above and its mkdir. Opening it then reports the real
+            // problem (a held lock, with its owner) instead of a bare EEXIST, and never overwrites the config it wrote.
+            if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') throw error;
+          }
         }
       }
       // Only plain `pi -p` joins: JSON and RPC output carry Pi's own events, which a joined reply would bypass.

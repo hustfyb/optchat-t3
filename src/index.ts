@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, writeSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { hostname } from 'node:os';
 import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -9,7 +9,7 @@ import { Type } from 'typebox';
 import { Memory } from './memory.ts';
 import { atomicWrite, storeFor } from './store.ts';
 import { createCompressor, type ModelChoice } from './compactor.ts';
-import { createProfile, holdProfile, instructions, isWindows, lastProfile, listProfiles, loadConfig, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+import { autoProfileName, createProfile, holdProfile, instructions, isWindows, lastProfile, listProfiles, loadConfig, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { allowSearch, CONTINUITY, IMPORT_GUIDANCE, SEARCH_DOC, TURN_REFRESHED, VIEW_DOC } from './core/prompts.ts';
 import { MASTER, modelsHint } from './prompts.ts';
 import { cachePayload, record } from './core/cache.ts';
@@ -223,13 +223,12 @@ export default function optchat(pi: ExtensionAPI) {
   // `--optchat-profile auto` names a profile after the session, for hosts that run many sessions in one
   // process and cannot set a profile per thread (T3 Code). The session id keeps the name stable across
   // resumes; the directory keeps it readable. It is created on first use with the model the session runs.
-  const autoProfile = (ctx: ExtensionContext) => {
-    const session = ctx.sessionManager.getSessionId();
-    const id = typeof session === 'string' ? session.replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase() : '';
-    if (id.length < 6) return undefined;
-    const slug = basename(ctx.cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
-    return `t3-${slug}-${id}`;
+  // A session the host does not persist (`--no-session`) has neither: see the guard in session_start.
+  const sessionPersisted = (ctx: ExtensionContext) => {
+    const manager = ctx.sessionManager as { isPersisted?: () => boolean };
+    return typeof manager.isPersisted === 'function' ? manager.isPersisted() : true;
   };
+  const autoProfile = (ctx: ExtensionContext) => sessionPersisted(ctx) ? autoProfileName(ctx.cwd, ctx.sessionManager.getSessionId()) : undefined;
   const openProfile = async (name: string, ctx: ExtensionContext) => {
     const dir = profilePath(name);
     if (!existsSync(dir)) throw new Error(`Profile ${name} does not exist. Use /optchat profile to create it.`);
@@ -318,6 +317,10 @@ export default function optchat(pi: ExtensionAPI) {
       }
       let name = boundName ?? (auto ? autoProfile(ctx) : typeof flag === 'string' ? flag : await chooseProfile(ctx));
       if (auto && !boundName) {
+        // A host that started Pi with `--no-session` (T3 Code's provider probe, one-off text generation) has no session
+        // to name a profile after and no file to bind it in: naming one left an empty profile behind on every run.
+        // Headless runs stay plain Pi; a person in a TUI is told the flag did nothing rather than left guessing.
+        if (!name && ctx.mode !== 'tui') { status(ctx); return; }
         if (!name) throw new Error('--optchat-profile auto needs a session: this host started Pi with --no-session.');
         if (!existsSync(profilePath(name))) {
           createProfile(name);

@@ -21,16 +21,21 @@ Providers → Pi → Launch arguments:  --optchat-profile auto
 Instead of reading a profile name, OptChat names the profile after the session it is opening:
 
 ```
-t3-<directory slug>-<first 8 characters of the session id>      e.g. t3-fairlead-01a185d0
+t3-<directory slug>-<first 12 and last 12 characters of the session id>      e.g. t3-tools-01a192272f4563a91f0e44c2
 ```
 
 - The session id keeps the name stable: T3 reuses the same session file when it resumes a thread, so the
   thread comes back to the same memory, and a session that already carries an `optchat.profile` binding
   keeps it (the binding wins over `auto`).
+- Both ends of the id are kept because a UUIDv7 session id starts with its millisecond timestamp: keeping
+  only the first 8 characters gave every session started inside the same 65.5 s the same profile, and the
+  second of two threads opened together died on the first one's lock. The full 24 characters stay unique
+  per session and keep the name, and the lock socket built from it, inside their length limits.
 - The profile is created on first use, with the model the session is already running (provider, model and
   thinking level), so a new thread needs no setup.
-- A host that starts Pi with `--no-session` has no id to derive from, and `auto` refuses loudly instead of
-  guessing.
+- A host that starts Pi with `--no-session` has no id to derive from: a headless run stays plain Pi and
+  creates no profile. That is how T3 Code runs its provider probe and its one-off text generation, which
+  used to leave an empty profile behind on every run. In the TUI, `auto` still refuses loudly.
 
 Explicit names still work exactly as before; `auto` is opt-in.
 
@@ -64,6 +69,8 @@ Profiles live in `~/.optchat` as before, so existing memories carry over.
 | Change | Why |
 |---|---|
 | `--optchat-profile auto` | one profile per T3 thread without a spawn wrapper |
+| the whole session id in the auto name | two threads opened within 65.5 s shared one profile, and the second died on its lock |
+| no profile for `--no-session` | T3's provider probe and one-off text generation left an empty profile per run |
 | keep the open profile on a repeated `session_start` | T3's session replacement used to crash the thread |
 | package name `optchat-t3`, version `…-t3.1` | installs next to upstream without pretending to be it |
 

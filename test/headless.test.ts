@@ -1,12 +1,12 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionFactory, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
-import { createProfile, lastProfile, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig } from '../src/profiles.ts';
+import { createProfile, lastProfile, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, listProfiles } from '../src/profiles.ts';
 import { textContent } from '../src/transcript.ts';
 import { emptyUsage } from '../src/usage.ts';
 import { removeDir } from './support.ts';
@@ -27,7 +27,8 @@ for (const name of ['work', 'personal']) {
 rememberProfile('personal');
 
 /** A headless Pi (print or RPC) whose model answers "OK to: <prompt>" and records what each call was sent. */
-async function headless(mode: 'print' | 'rpc', options: { flag?: string; bound?: string; connect?: string; agent?: string; hold?: Promise<void>; later?: ExtensionFactory } = {}) {
+async function headless(mode: 'print' | 'rpc', options: { flag?: string; bound?: string; connect?: string; agent?: string; hold?: Promise<void>; later?: ExtensionFactory;
+  /** A host that runs `--no-session`: Pi keeps no file and hands out a throwaway id. */ ephemeral?: boolean; sessionId?: string } = {}) {
   const dir = mkdtempSync(join(root, 's-'));
   const sent: string[] = [], errors: string[] = [];
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models.json'), refreshOnCreate: false });
@@ -49,7 +50,7 @@ async function headless(mode: 'print' | 'rpc', options: { flag?: string; bound?:
   const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, 'agent'), settingsManager,
     noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat, ...options.later ? [options.later] : []] });
   await loader.reload();
-  const manager = SessionManager.create(dir, join(dir, 'sessions'));
+  const manager = options.ephemeral ? SessionManager.inMemory(dir) : SessionManager.create(dir, join(dir, 'sessions'), options.sessionId ? { id: options.sessionId } : undefined);
   if (options.bound) manager.appendCustomEntry('optchat.profile', { name: options.bound });
   const { session } = await createAgentSession({ modelRuntime: runtime, model: runtime.getModel('fixture', 'fixture'), resourceLoader: loader, settingsManager, sessionManager: manager, tools: [] });
   if (options.flag) session.extensionRunner.setFlagValue('optchat-profile', options.flag);
@@ -67,7 +68,7 @@ async function headless(mode: 'print' | 'rpc', options: { flag?: string; bound?:
   };
   const bindings = () => manager.getEntries().flatMap(e => e.type === 'custom' && e.customType === 'optchat.profile' ? [e.data] : []);
   const close = async () => { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); };
-  return { ask, bindings, close, errors, notes, sent };
+  return { ask, bindings, close, errors, notes, sent, sessionId: manager.getSessionId(), dir };
 }
 
 test('a headless run without a binding or --optchat-profile is plain Pi: it answers, and no profile is picked or created', async () => {
@@ -198,8 +199,9 @@ test('--optchat-profile auto names the profile after the session and creates it 
     assert.match(await pi.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the prompt runs with the OptChat view');
     const [binding, ...rest] = pi.bindings();
     assert.equal(rest.length, 0, 'one binding');
-    assert.match(String((binding as { name?: string } | undefined)?.name), /^t3-s-[a-z0-9]+-[a-z0-9]{6,8}$/,
-      'the name is the directory slug plus the session id');
+    const id = pi.sessionId.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    assert.equal(String((binding as { name?: string } | undefined)?.name), `t3-${basename(pi.dir).toLowerCase()}-${id.slice(0, 12)}${id.slice(-12)}`,
+      'the name is the directory slug plus both ends of the session id, so two sessions never share one');
     const name = (binding as { name: string }).name, dir = profilePath(name);
     assert.ok(existsSync(join(dir, 'AGENTS.md')), 'the profile is complete, so /optchat instructions works');
     const config = loadConfig(dir);
@@ -209,6 +211,39 @@ test('--optchat-profile auto names the profile after the session and creates it 
     assert.equal(config.compactor.thinking, config.subagent.thinking, 'thinking follows the session');
     assert.deepEqual(pi.errors, []);
   } finally { await pi.close(); }
+});
+
+test('--optchat-profile auto gives two sessions whose ids share their first 8 characters different profiles', async () => {
+  // T3 Code opens threads in bursts. UUIDv7 ids started inside one 65.5 s window share their first 8 characters,
+  // so the shortened name gave them one profile, and the second session died on the first one's lock.
+  const first = await headless('rpc', { flag: 'auto', sessionId: '01a19227-2f21-7c00-8000-000000000001' });
+  const second = await headless('rpc', { flag: 'auto', sessionId: '01a19227-2f45-7c00-8000-000000000002' });
+  try {
+    assert.match(await first.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the first session runs with its own memory');
+    assert.match(await second.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the second session runs with its own memory too');
+    assert.deepEqual(first.errors, [], 'the first session was not taken down');
+    assert.deepEqual(second.errors, [], 'the second session did not meet the first one\'s lock');
+    const names = [first, second].map(pi => (pi.bindings()[0] as { name?: string } | undefined)?.name);
+    assert.ok(names[0] && names[1], 'both sessions saved a binding');
+    assert.notEqual(names[0], names[1], 'the two sessions name different profiles');
+    for (const name of names) assert.ok(existsSync(join(profilePath(String(name)), 'AGENTS.md')), `${name} exists`);
+  } finally { await first.close(); await second.close(); }
+});
+
+test('--optchat-profile auto with --no-session creates no profile and runs as plain Pi', async () => {
+  // T3 Code starts its provider probe and one-off text generation with --no-session; a profile named after the
+  // throwaway session id can never be resumed, so it was only an empty directory left behind on every run.
+  const before = listProfiles();
+  for (const mode of ['print', 'rpc'] as const) {
+    const pi = await headless(mode, { flag: 'auto', ephemeral: true });
+    try {
+      assert.equal(await pi.ask('Say OK'), 'OK to: Say OK', `${mode}: the prompt is answered without OptChat memory`);
+      assert.deepEqual(pi.errors, [], `${mode}: nothing failed`);
+      assert.deepEqual(pi.bindings(), [], `${mode}: a session with no file is not bound`);
+      assert.doesNotMatch(pi.sent[0] ?? '', /You are OptChat/, `${mode}: Pi's own prompt is untouched`);
+    } finally { await pi.close(); }
+  }
+  assert.deepEqual(listProfiles(), before, 'no profile was created for the throwaway session');
 });
 
 test('--optchat-profile auto leaves a session that is already bound to its own profile alone', async () => {

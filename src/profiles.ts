@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type { ModelChoice } from './compactor.ts';
 import { record } from './core/cache.ts';
 import { atomicWrite } from './store.ts';
@@ -24,6 +24,20 @@ export const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ma
 export function profilePath(name: string) {
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) throw new Error('Profile names: 1–64 lowercase letters, digits, hyphens, or underscores.');
   return join(dataHome(), 'profiles', name);
+}
+/**
+ * The profile name `--optchat-profile auto` derives from a host session: the working directory keeps it readable, the
+ * session id keeps it stable across resumes. UUIDv7 session ids (T3 Code) begin with the millisecond timestamp and put
+ * their randomness at the end, so both ends are kept: eight characters kept only the timestamp's high bits, which gave
+ * every session started inside the same 65.5 s window one profile name. Twenty-four characters stay unique per session
+ * and keep the name, and the lock socket built from it, inside their length limits.
+ */
+export function autoProfileName(cwd: string, sessionId: string | undefined) {
+  const id = typeof sessionId === 'string' ? sessionId.replace(/[^a-z0-9]/gi, '').toLowerCase() : '';
+  const unique = id.length > 24 ? `${id.slice(0, 12)}${id.slice(-12)}` : id;
+  if (unique.length < 6) return undefined;
+  const slug = basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
+  return `t3-${slug}-${unique}`;
 }
 export function listProfiles() {
   const root = join(dataHome(), 'profiles');

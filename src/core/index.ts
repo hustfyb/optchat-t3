@@ -5,9 +5,9 @@ export { isEntry, Memory, openMemory, Refused, VIEW, type Compression, type Comp
 export { isMime, type ImageStore, type Lease, type Mime, type Saved, type Store } from './store.ts';
 export { ACCEPTED_BYTES, createCompressor, type CompactorModel, type CompressorOptions, type Retryable } from './compactor.ts';
 export { cachePayload } from './cache.ts';
-export { allowSearch, COMPACT, CONTINUITY, SEARCH_DOC, TURN_REFRESHED, VIEW_DOC } from './prompts.ts';
-export { boundedMessage, completedExchange, logMessage, refreshBudget, refreshedRun, refreshPoint, textContent, withView, type AnyMessage, type ImageRef } from './messages.ts';
+export { allowSearch, CHILD, COMPACT, CONTINUITY, SEARCH_DOC, TURN_REFRESHED, VIEW_DOC } from './prompts.ts';
+export { boundedMessage, childInput, completedExchange, logMessage, refreshBudget, refreshedRun, refreshPoint, said, textContent, withView, type AnyMessage, type ImageRef } from './messages.ts';
 export { memoryTools, searchTool } from './tools.ts';
-export { decode, isImage, loadImages } from './images.ts';
+export { decode, isImage, loadImage, loadImages, ref, refName } from './images.ts';
 export type { ImageContent } from '@earendil-works/pi-ai';
 export { chronological, deduplicate, planImport, runImport, type ImportedEntry, type ImportMode } from './import.ts';

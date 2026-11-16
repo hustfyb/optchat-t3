@@ -5,8 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
-import { createProfile, loadConfig, profilePath, saveConfig } from '../src/profiles.ts';
-import type { ModelChoice } from '../src/compactor.ts';
+import { createProfile, loadConfig, profilePath, saveConfig, type ModelChoice } from '../src/profiles.ts';
 import { removeDir } from './support.ts';
 
 const model = (id: string, reasoning: boolean) =>
@@ -44,6 +43,7 @@ test('the main model and thinking level follow the profile', async () => {
     createProfile('fixture');
     const first = await open(dir, undefined, sessions);
     assert.equal(first.session.model?.id, 'plain', 'nothing saved yet: Pi keeps its own pick');
+    assert.deepEqual(first.saved(), { provider: 'fixture', model: 'plain', thinking: 'off' }, 'the first open records where Pi is, so the profile stops following Pi');
     await first.session.setModel(first.runtime.getModel('fixture', 'deep')!);
     first.session.setThinkingLevel('low');
     assert.deepEqual(first.saved(), { provider: 'fixture', model: 'deep', thinking: 'low' });

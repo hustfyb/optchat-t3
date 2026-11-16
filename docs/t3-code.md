@@ -74,5 +74,5 @@ Profiles live in `~/.optchat` as before, so existing memories carry over.
 | keep the open profile on a repeated `session_start` | T3's session replacement used to crash the thread |
 | package name `optchat-t3`, version `…-t3.1` | installs next to upstream without pretending to be it |
 
-Everything else is upstream [pi-optchat](https://github.com/jonaslsaa/pi-optchat) 0.11.0, unchanged.
+Everything else is upstream [pi-optchat](https://github.com/jonaslsaa/pi-optchat) 0.11.13, unchanged, except that a profile this process already has open is kept by name alone: T3 replaces the session under the extension it keeps running, and `--optchat-connect` decides what a busy profile does (T3 leaves it at `auto`, so a second thread in the same process becomes a connected window instead of failing).
 Tests for both changes run in the same suite (`npm test`).

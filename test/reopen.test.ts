@@ -40,6 +40,32 @@ async function start(dir: string) {
   return { session, notes };
 }
 
+// Pi's RPC mode binds extensions twice after a session switch, so the same session starts twice in one process.
+test('binding the same session twice keeps the profile this process already holds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-reopen-'));
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = join(dir, 'home');
+  let session: Awaited<ReturnType<typeof start>>['session'] | undefined;
+  try {
+    createProfile('fixture');
+    const profile = profilePath('fixture'), fixture = { provider: 'fixture', model: 'fixture', thinking: 'off' as const };
+    saveConfig(profile, { ...loadConfig(profile), compactor: fixture, subagent: fixture });
+
+    const started = await start(join(dir, 'project'));
+    session = started.session;
+    await session.prompt('hello');
+
+    await session.bindExtensions({ mode: 'tui' });
+    assert.deepEqual(started.notes.filter(note => /Profile already running|does not exist|Choose an OptChat profile/i.test(note)), [],
+      'the second start reports no busy or missing profile');
+    await session.prompt('still here');
+  } finally {
+    if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+    removeDir(dir);
+  }
+});
+
 // T3 Code hosts many Pi sessions in one process and replaces the session under the running extension, so
 // session_start reaches an instance that already holds the profile. Re-taking the profile lock would meet
 // this process's own socket, throw ProfileBusyError, and (outside the TUI) take the whole session down.

@@ -14,7 +14,9 @@ import { Children } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
-import { serveWindows, connectWindow, joinHeadless, listAttachableAgents, type WindowEvent } from '../src/window-bridge.ts';
+import { serveWindows, joinHeadless } from '../src/window-bridge.ts';
+import { connectWindow, listAttachableAgents, type WindowEvent } from '../src/window-client.ts';
+import { attachAgent } from '../src/files.ts';
 import { profileSocket, lockProfile, createProfile, profilePath } from '../src/profiles.ts';
 import { openConnectedWindow, registerConnectedRenderer } from '../src/connected-window.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
@@ -1266,4 +1268,111 @@ test('a handoff deferred by /reload is written by the reopened window on the nex
       assert.equal(f.summaries.length, 0);
     } finally { await restored.close(); }
   } finally { await f.close(); }
+});
+
+test('another app attaches through pi-optchat/files and stops a running agent: it ends and its parent gets the usual report', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'hold work until stopped' }], f.dir);
+  await until(() => !!f.children.live(id)?.streaming);
+  const agent = await attachAgent(f.dir, id, e => events.push(e));
+  try {
+    await until(() => events.some(e => e.live?.state === 'running'));
+    await agent.stop();
+    await until(() => f.children.history.records.get(id)?.state === 'stopped' && f.reports.some(t => t.includes(`[${id}]`)));
+    assert.match(f.reports.find(t => t.includes(`[${id}]`))!, /Stopped by the user/);
+    await until(() => events.some(e => e.name === 'finished'));
+  } finally { agent.close(); await close(); await f.close(); }
+});
+
+test("another app resumes a finished agent it attached to: the message is the user's, also as a skill, and the new report reaches the parent", async () => {
+  const f = await fixture();
+  mkdirSync(join(f.dir, '.pi', 'skills', 'review'), { recursive: true });
+  writeFileSync(join(f.dir, '.pi', 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Reviews code.\n---\nREVIEW_SKILL_BODY\n');
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'first result' }], f.dir);
+  await until(() => !f.children.live(id) && f.reports.some(t => t.includes(`[${id}]`)));
+  const agent = await attachAgent(f.dir, id, e => events.push(e));
+  try {
+    await until(() => events.some(e => e.name === 'finished'));
+    await agent.resume('/skill:review second result');
+    await until(() => f.children.history.records.get(id)?.state === 'completed' && f.reports.filter(t => t.includes(`[${id}]`)).length === 2);
+    assert.match(f.reports.at(-1) ?? '', /REVIEW_SKILL_BODY[\s\S]*second result/);
+    assert.deepEqual(f.children.history.records.get(id)?.guidance.map(g => [g.from, g.text, g.state]), [['user', '/skill:review second result', 'delivered']]);
+    assert.ok(f.memory.root.some(entry => entry.kind === 'user' && f.memory.text(entry.i) === `Direct guidance to subagent [${id}]: /skill:review second result`));
+    await until(() => events.filter(e => e.name === 'finished').length === 2);
+    // The finished view and the resumed one read the same session entries, so the cursor carries over: each message once.
+    assert.deepEqual(events.filter(e => e.name === 'message').map(e => [e.from, e.text.startsWith('Reply: ') ? 'Reply' : e.text]),
+      [['user', 'first result'], ['agent', 'Reply'], ['user', '/skill:review second result'], ['agent', 'Reply']]);
+  } finally { agent.close(); await close(); await f.close(); }
+});
+
+test('a resume refused during an import, or by a memory that cannot take the message, leaves the agent finished and resumable', async () => {
+  const f = await fixture();
+  let available = true;
+  const close = await serveWindows(f.dir, f.children, () => available, async () => {});
+  const [id] = await f.children.spawn([{ task: 'first result' }], f.dir);
+  await until(() => !f.children.live(id));
+  const finished: WindowEvent[] = [];
+  const agent = await attachAgent(f.dir, id, e => { if (e.name === 'finished') finished.push(e); });
+  try {
+    // Right after attaching, before the view has noticed the agent finished: the refusal is the import's.
+    available = false;
+    await assert.rejects(agent.resume('Not during an import'), /importing/);
+    available = true;
+    const append = f.memory.append;
+    f.memory.append = () => { throw new Error('Memory is closed'); };
+    await assert.rejects(agent.resume('Not without memory'), /Memory is closed/);
+    f.memory.append = append;
+    assert.equal(f.children.history.records.get(id)?.state, 'completed');
+    assert.equal(f.children.live(id), undefined);
+    await agent.resume('second result');
+    await until(() => f.children.history.records.get(id)?.state === 'completed' && finished.length > 0);
+  } finally { agent.close(); await close(); await f.close(); }
+});
+
+test('a finished view follows its agent again when the main agent resumes it, and the app can then say to it', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'first result' }], f.dir);
+  await until(() => !f.children.live(id));
+  const agent = await attachAgent(f.dir, id, e => events.push(e));
+  try {
+    await until(() => events.some(e => e.name === 'finished'));
+    await f.children.tell(id, 'hold work resumed by main');
+    await until(() => events.some(e => e.live?.state === 'running'));
+    await assert.rejects(agent.resume('Not while it runs'), /is running, so say reaches it/);
+    await agent.say('from the app');
+    assert.ok(f.children.history.records.get(id)?.guidance.some(g => g.from === 'user' && g.text === 'from the app'));
+    await agent.stop();
+    await until(() => events.filter(e => e.name === 'finished').length === 2);
+    // Each message once, across the reopen and the second finish: the stopped reply too, which only the final transcript has.
+    assert.deepEqual(events.filter(e => e.name === 'message').map(e => [e.from, e.text]),
+      [['user', 'first result'], ['agent', 'Reply: first result'], [undefined, 'hold work resumed by main'], ['agent', 'Reply: hold work resumed by main']]);
+  } finally { agent.close(); await close(); await f.close(); }
+});
+
+test('two apps resume the same finished agent at once: one wins, and both views follow the resumed turn once', async () => {
+  const f = await fixture();
+  const close = await serveWindows(f.dir, f.children, () => true, async () => {});
+  const [id] = await f.children.spawn([{ task: 'first result' }], f.dir);
+  await until(() => !f.children.live(id));
+  const views = [[], []] as WindowEvent[][];
+  const agents = await Promise.all(views.map(events => attachAgent(f.dir, id, e => events.push(e))));
+  try {
+    await until(() => views.every(events => events.some(e => e.name === 'finished')));
+    const results = await Promise.allSettled(agents.map((agent, i) => agent.resume(`hold work ${i}`)));
+    assert.deepEqual(results.map(r => r.status).sort(), ['fulfilled', 'rejected']);
+    const winner = `hold work ${results.findIndex(r => r.status === 'fulfilled')}`;
+    await until(() => views.every(events => events.some(e => e.live?.state === 'running')));
+    await agents[0].stop();
+    await until(() => views.every(events => events.filter(e => e.name === 'finished').length === 2));
+    for (const events of views) {
+      assert.deepEqual(events.filter(e => e.name === 'message' && e.from === 'user').map(e => e.text), ['first result', winner]);
+      assert.equal(events.filter(e => e.text === 'Reply: first result').length, 1, 'no replay across the reopen');
+    }
+  } finally { for (const agent of agents) agent.close(); await close(); await f.close(); }
 });

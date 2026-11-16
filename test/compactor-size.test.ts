@@ -9,16 +9,16 @@ import { createCompressor } from '../src/compactor.ts';
 import { compaction } from '../src/core/prompts.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
 import type { RunInfo } from '../src/runs.ts';
-import { bytes, NODE } from '../src/core/memory.ts';
+import { bytes, NODE, Refused } from '../src/core/memory.ts';
 import { emptyUsage } from '../src/usage.ts';
 import { removeDir } from './support.ts';
 
 let sentReasoning: string | undefined;
 let sentStep = '';
 let sentRetry = '';
-/** A fake model whose first reply is `first` bytes long and whose retries fit. */
+/** A fake model whose first reply is `first` bytes long and whose retries fit. `firstEnd` makes the first `ends` replies no summary. */
 async function attempts(first: number, { source = 'user: ' + 'a long message '.repeat(70), merge = false, accepted, first: text = 'x', firstEnd, ends = 1 }:
-  { source?: string; merge?: boolean; accepted?: number; first?: string; firstEnd?: 'length' | 'toolUse'; ends?: number } = {}) {
+  { source?: string; merge?: boolean; accepted?: number; first?: string; firstEnd?: 'length' | 'toolUse' | 'silent'; ends?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-size-'));
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models.json'), refreshOnCreate: false });
   let calls = 0;
@@ -34,17 +34,20 @@ async function attempts(first: number, { source = 'user: ' + 'a long message '.r
       sentRetry = context.messages.length > 1 && last?.role === 'user' && typeof last.content === 'string' ? last.content : '';
       const stream = createAssistantMessageEventStream();
       const end = calls < ends ? firstEnd ?? 'stop' : 'stop';
-      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: calls++ ? 'x'.repeat(400) : text.repeat(first) },
+      const line = { type: 'text' as const, text: calls++ ? 'x'.repeat(400) : text.repeat(first) };
+      // A silent reply spends all its output thinking and stops normally, with no text.
+      const stop = end === 'silent' ? 'stop' : end;
+      const message: AssistantMessage = { role: 'assistant', content: end === 'silent' ? [{ type: 'thinking', thinking: 'both lines say the same thing' }] : [line,
         ...end === 'toolUse' ? [{ type: 'toolCall' as const, id: 'call-1', name: 'zoom', arguments: { id: 0 } }] : []], api: model.api,
-        provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: end, usage: emptyUsage() };
-      queueMicrotask(() => { stream.push({ type: 'done', reason: end, message }); stream.end(); });
+        provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: stop, usage: emptyUsage() };
+      queueMicrotask(() => { stream.push({ type: 'done', reason: stop, message }); stream.end(); });
       return stream;
     },
   });
   try {
     const compress = createCompressor(new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'compactor', thinking: 'off' }),
       { accepted: accepted === undefined ? undefined : () => accepted });
-    const line = await compress({ context: '<chat>\n</chat>', source, part: merge ? { l: 1, i: 0 } : { l: 0, i: 0 } }, new AbortController().signal);
+    const line = await compress({ context: '<chat>\n</chat>', source, part: merge ? { l: 1, i: 0 } : { l: 0, i: 0 }, images: [] }, new AbortController().signal);
     return { calls, bytes: line.length };
   } finally { removeDir(dir); }
 }
@@ -54,10 +57,14 @@ test('a summary up to 640 bytes is kept; one over 640 is retried', async () => {
   assert.deepEqual(await attempts(641), { calls: 2, bytes: 400 });
 });
 
-test('a reply cut off at the token limit, or one that calls a tool, is no summary: it is asked again', async () => {
+test('a reply cut off at the token limit, one that calls a tool, or one with no text at all is no summary: it is asked again', async () => {
   assert.deepEqual(await attempts(100, { firstEnd: 'length' }), { calls: 2, bytes: 400 }, 'a short line cut off by stopReason length');
   assert.deepEqual(await attempts(100, { firstEnd: 'toolUse' }), { calls: 2, bytes: 400 }, 'a short line beside a tool call');
-  await assert.rejects(attempts(100, { firstEnd: 'length', ends: 5 }), /^Error: Compactor returned no whole line in 5 tries\.$/);
+  assert.deepEqual(await attempts(100, { firstEnd: 'silent' }), { calls: 2, bytes: 400 }, 'thinking only, no text');
+  // 5 of them are a refusal, so the node is not asked again (#193).
+  const refused = (error: Error) => error instanceof Refused && error.message === 'Compactor returned no whole line in 5 tries.';
+  await assert.rejects(attempts(100, { firstEnd: 'length', ends: 5 }), refused);
+  await assert.rejects(attempts(100, { firstEnd: 'silent', ends: 5 }), refused);
 });
 
 test('the profile\'s summary size tolerance decides when a line is retried', async () => {
@@ -78,9 +85,9 @@ test('a merge that is not smaller than the two lines it replaces is retried', as
 
 test('the task is the recipe\'s, with a 512-dash ruler for the size, and a merge names its lines and messages', () => {
   const ruler = '-'.repeat(NODE);
-  assert.equal(compaction({ source: 'user: hi', part: { l: 0, i: 40 } }),
+  assert.equal(compaction({ source: 'user: hi', part: { l: 0, i: 40 }, images: [] }),
     `Compaction: compress message 40 into one line of at most 512 bytes\n(about 70 words), the length of this ruler:\n${ruler}\n<input>\nuser: hi\n</input>`);
-  assert.equal(compaction({ source: 'a\nb', part: { l: 3, i: 5 } }),
+  assert.equal(compaction({ source: 'a\nb', part: { l: 3, i: 5 }, images: [] }),
     `Compaction: merge lines 40+4 and 44+4, adjacent, into one line of at most\n512 bytes (about 70 words), the length of this ruler:\n${ruler}\n`
     + `<chat> may hold their messages, 40 to 47, in more detail: take details\nof them from there too.\n<input>\na\nb\n</input>`);
 });

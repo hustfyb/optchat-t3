@@ -1,3 +1,5 @@
+import type { ImageContent } from '@earendil-works/pi-ai';
+import { namedImages } from './images.ts';
 import type { Saved, Store } from './store.ts';
 
 export const NODE = 512;
@@ -16,16 +18,21 @@ export interface Origin { source: string; conversation: string; message: string;
 export interface Entry { i: number; kind: Kind; text: string; date: string; receipt?: string; origin?: Origin }
 /** A message as memory keeps it in RAM: its text stays in the store, and `Memory.text(i)` reads it. */
 export type Message = Omit<Entry, 'text'>;
+/** A message's head as the model reads it, in its leaf, zoom and search: its kind, after `[IMP <day>]` for imported history (#201).
+ * The day costs 11 bytes, and in the A/B it kept dates in the summaries and saved most date() calls. */
+export const head = ({ kind, origin, date }: Message) => origin ? `[IMP ${date.slice(0, 10)}] ${kind}` : kind;
 export interface Part { l: number; i: number }
 /** A summary node as stores save it. `size` is its line's bytes in a view. */
 export interface Summary extends Part { text: string; size: number }
 /** A summary node as memory keeps it in RAM: `Memory.summary(part)` reads its text from the store. */
 export type Node = Omit<Summary, 'text'>;
 /** `part` is the node to build: a message's leaf, or the merge of its two halves. `call` is the tool call a tool result's leaf
- * answers, raw, since its own line is often not built yet (#153). */
-export interface Compression { context: string; source: string; part: Part; historical?: boolean; call?: { i: number; text: string } }
+ * answers, raw, since its own line is often not built yet (#153). `images` are the kept images a leaf's `source` names, with
+ * those names, in order (none for a merge): a message with any is compressed even when short, since its line is all that merges
+ * will ever know of them. */
+export interface Compression { context: string; source: string; part: Part; historical?: boolean; call?: { i: number; text: string }; images: { name: string; image: ImageContent }[] }
 export type Compressor = (input: Compression, signal: AbortSignal) => Promise<string>;
-/** A compressor throws this when the model itself gives no line for an input (a refusal, an empty reply, 5 cut-off replies):
+/** A compressor throws this when the model itself gives no line for an input (a refusal, 5 cut-off or empty replies):
  * asked again it fails alike, so the node keeps the start of its source instead of being retried forever (#193). */
 export class Refused extends Error {}
 const key = ({ l, i }: Part) => l * 2 ** 40 + i;
@@ -327,19 +334,25 @@ export class Memory {
   /** Nothing is being built, nothing more can start, and something failed: only a retry can make progress. */
   private get stalled() { return this.busy.size === 0 && !this.scheduled && this.retryAt.size > 0; }
   private async build(part: Part) {
-    const source = part.l === 0 ? `${this.root[part.i].kind}: ${this.text(part.i)}`
+    const source = part.l === 0 ? `${head(this.root[part.i])}: ${this.text(part.i)}`
       : [0, 1].map(offset => this.line({ l: part.l - 1, i: 2 * part.i + offset })).join('\n');
     const mergeSource = part.l > 0 ? [0, 1].map(offset => flat(this.line({ l: part.l - 1, i: 2 * part.i + offset }))).join('\n') : source;
     const call = part.l === 0 ? this.callOf(part.i) : undefined;
+    // A failed image read fails the build, which is retried like any store error; an image never kept is skipped. A zoom's page
+    // names images its message's own leaf already saw.
+    const input = cap(mergeSource, SOURCE);
+    // Only the images whose names the compactor gets: a huge message's cut middle sends neither.
+    const images = part.l === 0 && !this.copiesMemory(part.i) ? await namedImages(this.store, input) : [];
+    const short = bytes(source) <= NODE;
     let text = source;
-    if (bytes(source) > NODE) try {
-      text = (await this.compress({ context: this.compactionView(part), source: cap(mergeSource, SOURCE), part,
+    if (!short || images.length) try {
+      text = (await this.compress({ context: this.compactionView(part), source: input, part, images,
         historical: this.root.slice(start(part), end(part)).some(entry => !!entry.origin),
         ...(call !== undefined ? { call: { i: call, text: cap(`tool: ${this.text(call)}`, 4000) } } : {}) }, this.controller.signal)).trim();
       if (!text) throw new Refused('Compactor returned an empty summary.');
     } catch (error) {
       if (!(error instanceof Refused) || this.stopped) throw error;
-      text = cut(`${CLIPPED} ${flat(mergeSource)}`);
+      text = short ? source : cut(`${CLIPPED} ${flat(mergeSource)}`);
       this.warn(`Compactor ${start(part)}+${2 ** part.l}: ${error.message} (kept its start instead)`);
     }
     if (this.stopped) return;
@@ -403,9 +416,9 @@ export class Memory {
     if (!Number.isSafeInteger(id) || id < 0 || !Number.isSafeInteger(n) || n < 1 || !Number.isInteger(Math.log2(n)) || id % n || id + n > this.root.length)
       throw new Error(`No line ${id}+${n}: n is a power of 2, id a multiple of n. The tree's roots: ${this.roots() || 'none, the chat is empty'}.`);
     if (n === 1) {
-      const { kind } = this.root[id], text = this.text(id), page = Math.min(limit ?? PAGE, PAGE);
+      const line = head(this.root[id]), text = this.text(id), page = Math.min(limit ?? PAGE, PAGE);
       if (!Number.isSafeInteger(page) || page < 1) throw new Error('limit must be a positive integer.');
-      if (offset === undefined && text.length <= page) return `${id}+1|${kind}: ${text}`;
+      if (offset === undefined && text.length <= page) return `${id}+1|${line}: ${text}`;
       if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0 || offset >= Math.max(1, text.length)))
         throw new Error(`Message ${id} has ${text.length} characters; offset must be 0 to ${Math.max(0, text.length - 1)}.`);
       // Never split a surrogate pair: a page starts on its first half and ends after its second.
@@ -414,7 +427,7 @@ export class Memory {
       // A one-unit page on a pair takes the whole pair, so the next offset always moves forward.
       if (to < text.length && /[\ud800-\udbff]/.test(text[to - 1])) to += to - 1 === from ? 1 : -1;
       const hint = text.length <= PAGE ? `\n[note: this message is only ${text.length.toLocaleString('en-US')} characters and fits in one zoom; offset/limit are for messages over ${PAGE.toLocaleString('en-US')}]` : '';
-      return `${id}+1|${kind}: ${text.slice(from, to)}\n[showing characters ${from}-${to} of ${text.length}${to < text.length ? `; next page: offset ${to}` : ''}]${hint}`;
+      return `${id}+1|${line}: ${text.slice(from, to)}\n[showing characters ${from}-${to} of ${text.length}${to < text.length ? `; next page: offset ${to}` : ''}]${hint}`;
     }
     if (offset !== undefined) throw new Error('offset and limit page one message: use them with n = 1.');
     const l = Math.log2(n) - 1, i = 2 * id / n;
@@ -436,11 +449,15 @@ export class Memory {
   search(text: string, before = this.root.length) {
     const needle = text.toLowerCase(), hits: Message[] = [];
     for (let i = Math.min(before, this.root.length) - 1; i >= 0; i--) {
-      const message = this.root[i], body = this.text(i);
-      if ((message.kind === 'tool' || message.kind === 'echo') && /^(zoom|search)[ :]/.test(body)) continue;
-      if (body.toLowerCase().includes(needle)) hits.push(message);
+      if (this.copiesMemory(i)) continue;
+      if (this.text(i).toLowerCase().includes(needle)) hits.push(this.root[i]);
     }
     return hits;
+  }
+  /** A logged zoom or search call or result, which only copies memory. */
+  private copiesMemory(i: number) {
+    const { kind } = this.root[i];
+    return (kind === 'tool' || kind === 'echo') && /^(zoom|search)[ :]/.test(this.text(i));
   }
   date(id: number) {
     if (!Number.isSafeInteger(id) || !this.root[id]) throw new Error(`No message ${id}.`);

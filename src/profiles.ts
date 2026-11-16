@@ -3,27 +3,30 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { createConnection, createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import type { ModelChoice } from './compactor.ts';
 import { record } from './core/cache.ts';
 import { atomicWrite } from './store.ts';
 import type { Store } from './core/store.ts';
-import { DEFAULT_SETTINGS, readSettings, type Settings } from './settings.ts';
+import { DEFAULT_SETTINGS, invalid, readSettings, SETTING_KEYS, type Settings } from './settings.ts';
 
 export const isWindows = process.platform === 'win32';
 const PIPE_PREFIX = '\\\\.\\pipe\\';
 
+export const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export interface ModelChoice { provider: string; model: string; thinking: typeof THINKING[number] }
 export const dataHome = () => resolve(process.env.OPTCHAT_HOME ?? join(homedir(), '.optchat'));
-/** `main` is the last model and thinking level picked in Pi while this profile was open; absent until one is picked. */
+/** `main` is the last model and thinking level picked in Pi while this profile was open, recorded on the first open too. */
 export interface ProfileConfig extends Settings { compactor: ModelChoice; subagent: ModelChoice; main?: ModelChoice }
+/** A new profile's config. One shared object: copy it, don't change it. */
 export const defaults: ProfileConfig = {
   compactor: { provider: 'anthropic', model: 'claude-sonnet-5-5', thinking: 'medium' },
   subagent: { provider: 'anthropic', model: 'claude-opus-5-5', thinking: 'high' },
   ...DEFAULT_SETTINGS,
 };
-export const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
-export function profilePath(name: string) {
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) throw new Error('Profile names: 1–64 lowercase letters, digits, hyphens, or underscores.');
-  return join(dataHome(), 'profiles', name);
+const PROFILE_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+/** `home` is OptChat's data directory, `dataHome()` unless a host passes its own. */
+export function profilePath(name: string, home = dataHome()) {
+  if (!PROFILE_NAME.test(name)) throw new Error('Profile names: 1–64 lowercase letters, digits, hyphens, or underscores.');
+  return join(home, 'profiles', name);
 }
 /**
  * The profile name `--optchat-profile auto` derives from a host session: the working directory keeps it readable, the
@@ -39,12 +42,29 @@ export function autoProfileName(cwd: string, sessionId: string | undefined) {
   const slug = basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
   return `t3-${slug}-${unique}`;
 }
-export function listProfiles() {
-  const root = join(dataHome(), 'profiles');
-  return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(f.name)).map(f => f.name).sort() : [];
+export function listProfiles(home = dataHome()) {
+  const root = join(home, 'profiles');
+  return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && PROFILE_NAME.test(f.name)).map(f => f.name).sort() : [];
 }
-export function createProfile(name: string) {
-  const dir = profilePath(name);
+/** The file in a profile that names its active memory generation. */
+export const ACTIVE_MEMORY = 'active-memory.json';
+/** A memory generation's directory in profile `dir`: `.` is the profile itself, the others are imports' `memories/<id>`. */
+export function generationPath(dir: string, name: string) {
+  if (name !== '.' && !/^memories\/[a-f0-9-]{36}$/.test(name)) throw new Error('Invalid memory generation path.');
+  return join(dir, name);
+}
+/** The generation `active-memory.json` points at, which holds the profile's `main/` and `tree/`; without a pointer, the profile itself. */
+export function memoryDirectory(dir: string): string {
+  const file = join(dir, ACTIVE_MEMORY);
+  if (!existsSync(file)) return dir;
+  const name: unknown = JSON.parse(readFileSync(file, 'utf8'));
+  if (typeof name !== 'string') throw new Error('Invalid active memory pointer.');
+  const path = generationPath(dir, name);
+  if (!existsSync(join(path, 'main'))) throw new Error('Active memory generation is missing.');
+  return path;
+}
+export function createProfile(name: string, home = dataHome()) {
+  const dir = profilePath(name, home);
   if (existsSync(dir)) throw new Error(`Profile already exists: ${name}`);
   mkdirSync(resolve(dir, '..'), { recursive: true, mode: 0o700 });
   // Claim the directory exclusively, so a competing creator cannot have its
@@ -60,18 +80,50 @@ export function createProfile(name: string) {
   }
 }
 export function saveConfig(dir: string, config: ProfileConfig) { atomicWrite(join(dir, 'config.json'), JSON.stringify(config, null, 2) + '\n'); }
+/** Saves a change and applies it to `config`, the object a running Pi reads its settings from; throws if it can't be written. */
+export function applyConfig(dir: string, config: ProfileConfig, patch: Partial<ProfileConfig>) {
+  saveConfig(dir, { ...config, ...patch });
+  Object.assign(config, patch);
+}
 function modelChoice(value: unknown): value is ModelChoice {
   return record(value) && typeof value.provider === 'string' && typeof value.model === 'string'
     && THINKING.some(level => level === value.thinking);
 }
-export function loadConfig(dir: string): ProfileConfig {
-  const value: unknown = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+export const loadConfig = (dir: string) => parseConfig(dir, JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')));
+function parseConfig(dir: string, value: unknown): ProfileConfig {
   if (!record(value) || !modelChoice(value.compactor) || !modelChoice(value.subagent) || value.main !== undefined && !modelChoice(value.main)) throw new Error(`Invalid profile config: ${dir}/config.json`);
   const { compactor, subagent, main } = value;
   try { return { compactor, subagent, ...main && { main }, ...readSettings(value) }; }
   catch (error) { throw new Error(`Invalid profile config: ${dir}/config.json: ${error instanceof Error ? error.message : String(error)}`); }
 }
-export function instructions(dir: string) { return readFileSync(join(dir, 'AGENTS.md'), 'utf8'); }
+/** What another app may change: any setting, and the compactor or subagent model. The main model follows Pi's own pick. */
+export type ConfigPatch = Partial<Omit<ProfileConfig, 'main'>>;
+/** Checks a change as the settings page would; throws the first reason it can't be used. */
+export function checkPatch(patch: unknown): asserts patch is ConfigPatch {
+  if (!record(patch)) throw new Error('A config change must be an object.');
+  for (const [key, value] of Object.entries(patch)) {
+    if (key === 'main') throw new Error('The main model follows Pi: pick it there (RPC set_model), and Pi saves it to the profile.');
+    if (key === 'compactor' || key === 'subagent') {
+      if (!modelChoice(value)) throw new Error(`${key} must be { provider, model, thinking }, thinking one of ${THINKING.join(', ')}.`);
+      continue;
+    }
+    const setting = SETTING_KEYS.find(known => known === key);
+    if (!setting) throw new Error(`Unknown setting: ${key}.`);
+    const problem = invalid(setting, value);
+    if (problem) throw new Error(problem);
+  }
+}
+/** A change to config.json while no Pi holds the profile (call only under its lock). Keys this copy doesn't know stay as they are. */
+export function patchConfigFile(dir: string, patch: ConfigPatch) {
+  const raw: unknown = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+  if (!record(raw)) throw new Error(`Invalid profile config: ${dir}/config.json`);
+  const next = { ...raw, ...patch }, config = parseConfig(dir, next);
+  atomicWrite(join(dir, 'config.json'), JSON.stringify(next, null, 2) + '\n');
+  return config;
+}
+export function readInstructions(dir: string) { return readFileSync(join(dir, 'AGENTS.md'), 'utf8'); }
+/** The profile's instructions, read again each turn, so a save applies from the next one. */
+export function saveInstructions(dir: string, text: string) { atomicWrite(join(dir, 'AGENTS.md'), text); }
 export function lastProfile() {
   try { const name = readFileSync(join(dataHome(), 'last-profile'), 'utf8').trim(); return listProfiles().includes(name) ? name : undefined; }
   catch { return undefined; }
@@ -106,15 +158,32 @@ function existingSocket(path: string): { stat: Stats; removable: true } | { remo
 /** Removes a dead socket left by a previous owner. */
 export function removeStaleSocket(path: string) { if (existingSocket(path)?.removable) unlinkSync(path); }
 
-/** Asks the current owner who holds the socket; nothing answering means the entry is stale. A Windows pipe that has disappeared reports ENOENT instead of ECONNREFUSED. */
+/** Asks the current owner who holds the socket; nothing answering means the entry is stale, and a socket or pipe that is gone (ENOENT) means nobody holds it. */
 function readOwner(path: string) {
   return new Promise<string | undefined>((resolve, reject) => {
     const socket = createConnection(path); let message = '';
     socket.setTimeout(1500, () => { socket.destroy(); reject(new Error('Profile lock did not respond; refusing to steal it.')); });
     socket.on('data', data => { message += data.toString(); });
     socket.on('end', () => resolve(message || 'another Pi instance'));
-    socket.on('error', e => { if ('code' in e && (e.code === 'ECONNREFUSED' || isWindows && e.code === 'ENOENT')) resolve(undefined); else reject(e); });
+    socket.on('error', e => { if ('code' in e && (e.code === 'ECONNREFUSED' || e.code === 'ENOENT')) resolve(undefined); else reject(e); });
   });
+}
+
+/** The Pi holding a profile. */
+export interface Owner { profile: string; pid: number; host: string; cwd: string }
+/** How Pi describes itself on the lock, which "Profile already running: …" shows. A profile name and a host name can't contain
+ * " · ", so `OWNER` reads it back even when the cwd does. */
+export const describeOwner = ({ profile, pid, host, cwd }: Owner) => `${profile} · PID ${pid} · ${host} · ${cwd}`;
+const OWNER = /^([a-z0-9_-]+) · PID (\d+) · (.*?) · ([\s\S]*)$/;
+/** Who holds the profile in `dir`, without taking it; undefined when nobody does. Rejects when the holder doesn't answer within
+ * 1.5 seconds or describes itself some other way, so either still counts as busy. */
+export async function profileOwner(dir: string): Promise<Owner | undefined> {
+  const description = await readOwner(profileSocket(dir));
+  if (description === undefined) return undefined;
+  const match = OWNER.exec(description);
+  if (!match) throw new Error(`Profile is held by ${description}.`);
+  const [, profile, pid, host, cwd] = match;
+  return { profile, pid: Number(pid), host, cwd };
 }
 
 /** OS-owned socket lifetime, no timeout-based stealing of a busy profile. */

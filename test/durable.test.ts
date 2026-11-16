@@ -5,14 +5,15 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRegistry, Harness } from '@earendil-works/pi-durable';
+import { configure, createRegistry, defineExtension, defineTool, Harness, type ConversationId, type Extension } from '@earendil-works/pi-durable';
+import { Type } from 'typebox';
 import { SqliteStorage } from '@earendil-works/pi-durable/storage/sqlite';
 import { BACKGROUND_CONTEXT as context } from '@earendil-works/chord/context';
 import { NodeSqliteDatabase } from '@earendil-works/chord/sqlite/node';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxResponseStep } from '@earendil-works/pi-ai/providers/faux';
-import { openMemory, type Compressor, type ImageStore, type ImportedEntry, type Mime } from '../src/core/index.ts';
-import { optchat, optchatImport, SqliteStore, withCacheMarks, type Read, type SqliteStoreOptions } from '../src/durable/index.ts';
+import { CHILD, cachePayload, isImage, openMemory, refName, textContent, type Compressor, type ImageStore, type ImportedEntry, type Mime } from '../src/core/index.ts';
+import { optchat, optchatImport, SqliteStore, withCacheMarks, type OptChatOptions, type Read, type SqliteStoreOptions } from '../src/durable/index.ts';
 import { importTables } from '../src/durable/store.ts';
 import { imageRef } from '../src/images.ts';
 import { removeDir } from './support.ts';
@@ -24,7 +25,8 @@ const text = (content: unknown) => typeof content === 'string' ? content
 /** One OptChat agent on Pi Durable, over one SQLite database as in a Durable Object: Pi's tables `pi_*`, memory's `optchat_*`. */
 /** `importing` builds an import's summaries (`compress` by default). */
 async function open(file: string, replies: FauxResponseStep[], compress: Compressor = async ({ part }) => `line ${part.l}/${part.i}`,
-  { contextWindow, images, importing = compress }: { contextWindow?: number; importing?: Compressor } & SqliteStoreOptions = {}) {
+  { contextWindow, images, importing = compress, afterView, search, extensions = () => [] }:
+    { contextWindow?: number; importing?: Compressor; extensions?: (chat: ReturnType<typeof optchat>) => Extension[] } & SqliteStoreOptions & Pick<OptChatOptions, 'afterView' | 'search'> = {}) {
   const sync = new DatabaseSync(file), db = new NodeSqliteDatabase(sync);
   const faux = fauxProvider(contextWindow ? { models: [{ id: 'small', contextWindow }] } : {}), models = createModels();
   models.setProvider(faux.provider);
@@ -35,7 +37,7 @@ async function open(file: string, replies: FauxResponseStep[], compress: Compres
   }));
   const query: Read = (sql, ...params) => sync.prepare(sql).iterate(...params);
   const memory = await openMemory(new SqliteStore(db, query, { images }), compress);
-  const memoryExtension = optchat({ memory });
+  const memoryExtension = optchat({ memory, afterView, search });
   // Resolves when an import goes live, and rejects when a task fails, so a failed import doesn't leave a test waiting.
   let activate = () => {}, fault = (_: unknown) => {};
   const activated = new Promise<void>((resolve, reject) => { activate = resolve; fault = reject; });
@@ -50,6 +52,7 @@ async function open(file: string, replies: FauxResponseStep[], compress: Compres
   const registry = createRegistry();
   registry.install(memoryExtension.extension);
   registry.install(importer.extension);
+  for (const extension of extensions(memoryExtension)) registry.install(extension);
   const harness = await Harness.open(await SqliteStorage.open(db, { prefix: 'pi_' }),
     { models: withCacheMarks(models), registry, settings: { compaction: { enabled: false }, afterFailedRun: 'continue' },
       onReport: (error, info) => { if (info.type === 'task_faulted' || info.type === 'task_parked') fault(error); } }, context);
@@ -73,7 +76,7 @@ async function open(file: string, replies: FauxResponseStep[], compress: Compres
   };
   const close = async () => { await harness.close(context); await memory.close(); await db.close(); };
   const keptInSqlite = () => sync.prepare('SELECT count(*) AS n FROM optchat_images').get()?.n;
-  return { memory, root, sent, ask, idle, close, keptInSqlite, harness, importer, activated, loaded, db, query, sql: sync };
+  return { memory, root, sent, ask, idle, close, keptInSqlite, harness, importer, activated, loaded, db, query, sql: sync, chat: memoryExtension };
 }
 // A test may close a database and open it again, so the folders go once every test is done.
 const dirs: string[] = [];
@@ -264,6 +267,120 @@ test('with an images store, images go there, and zoom reads them from it', async
   } finally { await agent.close(); }
 });
 
+/** A tool that returns `images` after `text`. */
+const camera = (images: (typeof photo)[], text = 'snap'): Extension => defineExtension({ name: 'camera', tools: [defineTool({
+  name: 'camera', description: 'Takes a photo.', parameters: Type.Object({}), replay: 'safe',
+  execute: async () => ({ output: [{ type: 'text', text }, ...images] }),
+})] });
+const snap = () => [fauxAssistantMessage(fauxToolCall('camera', {}), { stopReason: 'toolUse' }), fauxAssistantMessage('nice')];
+/** Whether any of Pi Durable's rows holds `data`. */
+const inPiRows = (agent: Awaited<ReturnType<typeof open>>, data: string) => agent.sql.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi\\_%' ESCAPE '\\'").all()
+  .some(({ name }) => agent.sql.prepare(`SELECT * FROM "${String(name)}"`).all().some(row => JSON.stringify(row).includes(data)));
+const imagesIn = (request: Sent | undefined, role: string) => (request ?? []).flatMap(m => m.role === role && Array.isArray(m.content) ? m.content.filter(isImage) : []);
+const contentOf = (request: Sent | undefined, role: string) => request?.find(m => m.role === role)?.content;
+const nameOf = (image: typeof photo) => refName(imageRef(image)) ?? '';
+const memoryImages = () => {
+  const kept = new Map<string, { mimeType: Mime; data: Uint8Array }>();
+  const images: ImageStore = { putImage: async (name, mimeType, data) => void kept.set(name, { mimeType, data }), image: name => kept.get(name) };
+  return { kept, images };
+};
+
+test('a tool\'s images and a user\'s sent through offloadImages are kept once, in the images store: Pi\'s rows hold their refs, requests the images', async () => {
+  const { kept, images } = memoryImages(), user = { ...photo, data: Buffer.alloc(1000, 9).toString('base64') };
+  const agent = await open(file(), snap(), undefined, { images, extensions: () => [camera([photo])] });
+  try {
+    const content = await agent.chat.offloadImages([{ type: 'text', text: 'take one like this' }, user]);
+    assert.deepEqual(content, [{ type: 'text', text: 'take one like this' }, { type: 'text', text: imageRef(user) }]);
+    await (await agent.root.submit({ type: 'input', content }, context)).wait(context);
+    await agent.idle();
+    assert.ok(!inPiRows(agent, photo.data) && !inPiRows(agent, user.data));
+    assert.deepEqual(imagesIn(agent.sent[0], 'user'), [user]);
+    assert.deepEqual(imagesIn(agent.sent[1], 'user'), [user]);
+    assert.deepEqual(contentOf(agent.sent[1], 'toolResult'), [{ type: 'text', text: 'snap' }, photo]);
+    // Memory names them as it names inline images.
+    assert.deepEqual(agent.memory.entries().map(e => e.text), [`take one like this\n${imageRef(user)}`, 'camera {}', `camera: snap\n${imageRef(photo)}`, 'nice']);
+    assert.deepEqual([...kept.keys()].sort(), [nameOf(user), nameOf(photo)].sort());
+  } finally { await agent.close(); }
+});
+
+test('after a restart, zoom returns a tool\'s kept image; its own result keeps only refs, and memory logs zoom\'s page as it is', async () => {
+  const { images } = memoryImages(), f = file();
+  const agent = await open(f, snap(), undefined, { images, extensions: () => [camera([photo])] });
+  try { await agent.ask('take one'); } finally { await agent.close(); }
+  const again = await open(f, [fauxAssistantMessage(fauxToolCall('zoom', { id: 2 }), { stopReason: 'toolUse' }), fauxAssistantMessage('here')], undefined, { images });
+  try {
+    await again.ask('show it again');
+    assert.deepEqual(imagesIn(again.sent[1], 'toolResult'), [photo]);
+    assert.ok(!inPiRows(again, photo.data));
+    assert.equal(again.memory.text(6).split(imageRef(photo)).length, 2);
+  } finally { await again.close(); }
+});
+
+test('zoom returns a user\'s image that came in as unpadded base64: the store gives it back padded, under another name', async () => {
+  const { images } = memoryImages(), unpadded = { ...photo, data: photo.data.replace(/=+$/, '') };
+  const agent = await open(file(), [fauxAssistantMessage('nice'), fauxAssistantMessage(fauxToolCall('zoom', { id: 0 }), { stopReason: 'toolUse' }), fauxAssistantMessage('here')], undefined, { images });
+  try {
+    await (await agent.root.submit({ type: 'input', content: await agent.chat.offloadImages([{ type: 'text', text: 'look' }, unpadded]) }, context)).wait(context);
+    await agent.idle();
+    await agent.ask('show it again');
+    assert.deepEqual(imagesIn(agent.sent.at(-1), 'toolResult'), [photo]);
+  } finally { await agent.close(); }
+});
+
+test('an image the store refuses stays inline in Pi\'s row and still reaches the model', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const { kept, images } = memoryImages(), refused = { ...photo, data: Buffer.alloc(1000, 8).toString('base64') }, putImage = images.putImage;
+  images.putImage = (name, mimeType, data) => name === nameOf(refused) ? Promise.reject(new Error('full')) : putImage(name, mimeType, data);
+  const agent = await open(file(), snap(), undefined, { images, extensions: () => [camera([photo, refused])] });
+  try {
+    await agent.ask('take two');
+    assert.ok(!inPiRows(agent, photo.data) && inPiRows(agent, refused.data));
+    assert.deepEqual(imagesIn(agent.sent[1], 'toolResult'), [photo, refused]);
+    assert.deepEqual([...kept.keys()], [nameOf(photo)]);
+  } finally { await agent.close(); }
+});
+
+test('a tool result that could pass Pi Durable\'s bound keeps its images inline: bounding it would drop their refs', async () => {
+  const { images } = memoryImages(), lines = Array.from({ length: 2_500 }, (_, i) => `line ${i}`).join('\n');
+  const agent = await open(file(), snap(), undefined, { images, extensions: () => [camera([photo], lines)] });
+  try {
+    await agent.ask('take one');
+    assert.deepEqual(imagesIn(agent.sent[1], 'toolResult'), [photo]);
+  } finally { await agent.close(); }
+});
+
+test('a ref the store lacks or can\'t read is sent as its text, and the run goes on', async (t) => {
+  t.mock.method(console, 'error', () => {});
+  const missing = { ...photo, data: Buffer.alloc(1000, 5).toString('base64') };
+  const images: ImageStore = { putImage: async () => {}, image: name => { if (name === nameOf(photo)) throw new Error('down'); return undefined; } };
+  const agent = await open(file(), snap(), undefined, { images, extensions: () => [camera([photo, missing])] });
+  try {
+    assert.equal((await agent.ask('take two')).status, 'done');
+    assert.deepEqual(contentOf(agent.sent[1], 'toolResult'), [{ type: 'text', text: 'snap' }, { type: 'text', text: imageRef(photo) }, { type: 'text', text: imageRef(missing) }]);
+  } finally { await agent.close(); }
+});
+
+test('a step a refresh dropped has its image read once more, for its summary, not for each request after', async () => {
+  // A window of 10,000 tokens: a refresh once the run passes 12,000 characters (30%), each step here an image of about 4,800.
+  let shot = 0;
+  const camera: Extension = defineExtension({ name: 'camera', tools: [defineTool({
+    name: 'camera', description: 'Takes a photo.', parameters: Type.Object({}), replay: 'safe',
+    execute: async () => ({ output: [{ type: 'text', text: 'snap' }, { ...photo, data: Buffer.alloc(1000, ++shot).toString('base64') }] }),
+  })] });
+  const { images } = memoryImages(), store = images.image, reads: { request: number; name: string }[] = [];
+  const agent = await open(file(), [...Array.from({ length: 5 }, () => fauxAssistantMessage(fauxToolCall('camera', {}), { stopReason: 'toolUse' })), fauxAssistantMessage('done')],
+    undefined, { images: { ...images, image: name => { reads.push({ request: agent.sent.length, name }); return store(name); } }, extensions: () => [camera], contextWindow: 10_000 });
+  try {
+    await agent.ask('take five');
+    assert.ok(agent.sent.some(request => request.some(m => text(m.content).includes('this turn grew long'))), 'a request was refreshed');
+    // The first photo is read for the two requests that send it and once for its summary, not again for the requests after the
+    // refresh that dropped it.
+    const first = nameOf({ ...photo, data: Buffer.alloc(1000, 1).toString('base64') });
+    assert.deepEqual(reads.filter(read => read.name === first).map(read => read.request), [1, 2, 3]);
+    assert.deepEqual(agent.sent.map(request => imagesIn(request, 'toolResult').some(image => nameOf(image) === first)), [false, true, true, false, false, false]);
+  } finally { await agent.close(); }
+});
+
 test('cache marks go on an Anthropic request that carries the view; a request with its own onPayload is left alone', async () => {
   const faux = fauxProvider({ api: 'anthropic-messages' }), models = createModels();
   models.setProvider(faux.provider);
@@ -339,6 +456,122 @@ test('reopened mid-run after a refresh, the run is sent from where the log says'
     // Five steps before the eviction, each logged once although the refresh logged some of them before it.
     assert.deepEqual(after.memory.root.map(e => e.kind), ['user', ...Array(5).fill(['tool', 'echo']).flat(), 'talk']);
   } finally { await after.close(); }
+});
+
+test('afterView\'s text follows the view, before the previous exchange, outside its cache marks; fixed until a refresh, and never logged', async () => {
+  let calls = 0;
+  const agent = await open(file(), [fauxAssistantMessage('Hi'), read(0), read(1), read(2), read(3), read(4), read(5), fauxAssistantMessage('done')], undefined,
+    { contextWindow: 150, afterView: async () => `Now: ${++calls}` });
+  try {
+    await agent.ask('hello');
+    await agent.ask('read them all');
+    const firsts = agent.sent.map(request => text(request.find(m => m.role === 'user')?.content ?? ''));
+    assert.equal(firsts[1].split('</chat>').at(-1), '\n\nNow: 2\n\nhello');
+    const nows = firsts.map(request => request.match(/Now: \d+/)?.[0]);
+    const refreshed = agent.sent.findIndex(request => request.some(m => text(m.content).includes('this turn grew long')));
+    assert.deepEqual([nows[0], ...new Set(nows.slice(1, refreshed))], ['Now: 1', 'Now: 2']);
+    assert.notEqual(nows[refreshed], nows[refreshed - 1]);
+    // On Anthropic the view keeps its blocks and marks, and the app's text goes after them unmarked.
+    const marked = (request: string) => {
+      const content: object[] = [{ type: 'text', text: request }];
+      cachePayload({ messages: [{ role: 'user', content }] }, { end: false });
+      return content;
+    };
+    const [view, after] = firsts[refreshed].split(/(?<=<\/chat>)/);
+    assert.ok(JSON.stringify(marked(view)).includes('cache_control'));
+    assert.deepEqual(marked(firsts[refreshed]), [...marked(view), { type: 'text', text: after }]);
+    const piEntries = (await agent.root.entries({ order: 'ascending' }, 256, undefined, context)).items;
+    assert.ok(![...agent.memory.entries(), ...piEntries.map(e => ({ text: JSON.stringify(e) }))].some(e => e.text.includes('Now:')));
+  } finally { await agent.close(); }
+});
+
+test('when afterView throws, the request still carries the view', async (t) => {
+  const errors = t.mock.method(console, 'error', () => {});
+  const agent = await open(file(), [fauxAssistantMessage('Hi')], undefined, { afterView: () => { throw new Error('no state'); } });
+  try {
+    await agent.ask('hello');
+    assert.deepEqual(agent.sent[0].filter(m => m.role !== 'system').map(m => text(m.content)), ['<chat>\n\n</chat>\n\nhello']);
+    assert.match(String(errors.mock.calls[0]?.arguments[0]), /no state/);
+  } finally { await agent.close(); }
+});
+
+test('a snapshot starts a child with the view, afterView, the previous exchange and the run so far; it reads memory and is never logged', async () => {
+  // Pi Durable's subagent recipe, as docs/durable.md gives it. The tool runs twice, as a rerun after a crash would: the second time
+  // it finds the child and its submission, so it takes no second snapshot and the child keeps its first input.
+  let child: ConversationId | undefined;
+  const review = (chat: ReturnType<typeof optchat>): Extension => defineExtension({ name: 'review', tools: [defineTool({
+    name: 'review', description: 'A second opinion on a draft.', parameters: Type.Object({ draft: Type.String() }), replay: 'safe',
+    execute: async ({ draft }, api, ctx) => {
+      const requestId = `review:${api.taskId}`;
+      let answer = '';
+      for (const _rerun of [false, true]) {
+        const found = await api.commit(async tx => {
+          const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+          if (existing) return { id: existing.id, submitted: !!await tx.submissionByRequest(existing.id, requestId) };
+          const created = await tx.createConversation({ ownership: { kind: 'task', taskId: api.taskId } });
+          await configure(tx, created.id, { extensions: { remove: [review(chat)] } });
+          return { id: created.id, submitted: false };
+        }, ctx);
+        child = found.id;
+        const content = found.submitted ? [] : await chat.snapshot(`Review this draft: ${draft}`, ctx);
+        const settled = await (await (await api.conversation(found.id, ctx))!.submit({ type: 'input', content, requestId }, ctx)).wait(ctx);
+        if (settled.answer) answer = textContent((await api.commit(tx => tx.entry(settled.answer), ctx))?.model?.[0]?.content);
+      }
+      return { output: [{ type: 'text', text: answer }] };
+    },
+  })] });
+  const requests: { sections: string[]; tools: string[]; sent: string[] }[] = [];
+  const childAnswers = (reply: FauxResponseStep): FauxResponseStep => (request, ...rest) => {
+    const system = request.messages.flatMap(m => m.role === 'system' ? [m] : []);
+    requests.push({ sections: system.flatMap(m => Object.values(m.sections ?? {}).flatMap(s => s ?? [])),
+      tools: system.flatMap(m => m.toolsAdded ?? []).map(t => t.name),
+      sent: request.messages.flatMap(m => m.role === 'system' ? [] : [`${m.role}: ${text(m.content)}`]) });
+    return typeof reply === 'function' ? reply(request, ...rest) : reply;
+  };
+  const agent = await open(file(), [
+    fauxAssistantMessage('Hi Jonas'),
+    read(0),
+    fauxAssistantMessage(fauxToolCall('review', { draft: 'Hei Kari' }), { stopReason: 'toolUse' }),
+    childAnswers(fauxAssistantMessage(fauxToolCall('zoom', { id: 0 }), { stopReason: 'toolUse' })),
+    childAnswers(fauxAssistantMessage('Looks fine.')),
+    fauxAssistantMessage('Sent.'),
+  ], undefined, { afterView: () => 'Now: Monday', search: true, extensions: chat => [review(chat)] });
+  try {
+    await agent.ask('hello');
+    await agent.ask('write to Kari');
+    const logged = agent.memory.entries().map(e => `${e.kind}: ${e.text}`), echo = `echo: date: ${new Date(agent.memory.root[0].date).toString()}`;
+    // The run so far holds this tool's own call, and the steps before it as text lines.
+    const input = [
+      '<chat>\n0+1|user: hello\n1+1|talk: Hi Jonas\n</chat>\n\nNow: Monday',
+      'The exchange before this run:\nuser: hello\ntalk: Hi Jonas',
+      `This run so far:\nuser: write to Kari\ntool: date {"id":0}\n${echo}\ntool: review {"draft":"Hei Kari"}`,
+      'Your task:\nReview this draft: Hei Kari',
+    ].join('\n\n');
+    // The child's requests are its own: no view put before its input, nothing refreshed, one input for both runs of the tool.
+    assert.deepEqual(requests.map(r => r.sent), [[`user: ${input}`], [`user: ${input}`, 'assistant: [toolCall]', 'toolResult: 0+1|user: hello']]);
+    assert.ok(requests[0].sections.some(s => s.startsWith(CHILD)));
+    assert.deepEqual(requests[0].tools, ['zoom', 'date', 'search']);
+    // Memory logs the parent's run, with the child's answer only as the tool's result: not the child's zoom, nor its reply.
+    assert.deepEqual(logged.slice(2), [
+      'user: write to Kari', 'tool: date {"id":0}', echo, 'tool: review {"draft":"Hei Kari"}', 'echo: review: Looks fine.', 'talk: Sent.',
+    ]);
+    // Only the parent is reset once idle; the child keeps its context.
+    const kinds = (await (await agent.harness.conversation(child!, context))!.context(context)).entries.map(e => e.kind);
+    assert.deepEqual(kinds.filter(kind => kind !== 'pi.system'), ['pi.user', 'pi.assistant', 'pi.tool-result', 'pi.assistant']);
+  } finally { await agent.close(); }
+});
+
+test('a snapshot while idle leaves the next request its own view: afterView is asked again; a reset\'s note shows as memory logs it', async () => {
+  let calls = 0;
+  const agent = await open(file(), [fauxAssistantMessage('Hi'), fauxAssistantMessage('Again')], undefined, { afterView: () => `Now: ${++calls}` });
+  try {
+    await agent.ask('hello');
+    await agent.root.reset('Carry on with the draft', context);
+    assert.equal(text(await agent.chat.snapshot('Check the draft', context)).split('</chat>\n\n')[1],
+      'Now: 2\n\nThis run so far:\nuser: [Handoff note] Carry on with the draft\n\nYour task:\nCheck the draft');
+    await agent.ask('again');
+    assert.match(text(agent.sent[1].find(m => m.role === 'user')?.content ?? ''), /<\/chat>\n\nNow: 3\n/);
+  } finally { await agent.close(); }
 });
 
 // Imports: a new generation is built beside the live one by a Pi Durable task, and made live in one transaction.

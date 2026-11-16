@@ -8,6 +8,12 @@ const MIMES = new Map<string, Mime>((Object.keys(EXTENSIONS) as Mime[]).map(mime
 /** The one place a profile's store is chosen. A `store` setting will plug in here; until then every profile keeps its memory in files. */
 export const storeFor = (directory: string, warn: (s: string) => void = console.error): Store => new FileStore(directory, warn);
 
+/** Pi's imports before #201 started each message's text with a "[Historical …]" line; its `[IMP <day>]` head says that now, so
+ * loading drops it. Only the two shapes Pi wrote match, `<source> · <ISO time> · conversation <id> · <title>` and (from #64)
+ * `<source> · <YYYY-MM-DD HH:MM>Z · <13 characters of the id> · <title>`, so a message that itself starts "[Historical" keeps it.
+ * A Claude Code memory note's line names the memory, and its source isn't one word, so it stays. */
+export const LEGACY_HEADER = /^\[Historical [a-z]+ · \d{4}-\d{2}-\d{2}(?:T[\d:.]+Z · conversation \S+| \d{2}:\d{2}Z · \S+) · [\s\S]*?\]\n/;
+
 export function localDay(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
@@ -40,10 +46,10 @@ export function appendJson(file: string, value: unknown, size?: number) {
     return fstatSync(fd).size;
   } finally { closeSync(fd); }
 }
+const logs = (dir: string) => existsSync(dir) ? readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort() : [];
 function records(dir: string, warn: (s: string) => void): unknown[] {
-  if (!existsSync(dir)) return [];
   const result: unknown[] = [];
-  for (const name of readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort()) {
+  for (const name of logs(dir)) {
     const file = join(dir, name);
     for (const [index, line] of readFileSync(file, 'utf8').split('\n').entries()) {
       if (!line.trim()) continue;
@@ -65,17 +71,23 @@ export class FileStore implements Store {
   constructor(readonly directory: string, private readonly warn: (s: string) => void = console.error) {}
   load(): Saved {
     for (const sub of ['main', 'tree']) mkdirSync(join(this.directory, sub), { recursive: true, mode: 0o700 });
-    const main = join(this.directory, 'main'), entries = records(main, this.warn);
-    for (const name of readdirSync(main).filter(n => n.endsWith('.jsonl'))) this.lastSeenBytes.set(join(main, name), statSync(join(main, name)).size);
+    return this.read();
+  }
+  /** Loads without creating anything. Another process may be writing meanwhile (FileReader): the view refers only to nodes and
+   * messages written before it, and a node only to messages, so reading them in that order never meets a part not read yet; a
+   * line still being written fails to parse and is skipped. */
+  protected read(): Saved {
     const view = join(this.directory, 'view.json');
     // An unreadable view is rebuilt, as a damaged one is.
     let saved: string | undefined;
     if (existsSync(view)) try { saved = readFileSync(view, 'utf8'); } catch { saved = ''; }
     const tree = records(join(this.directory, 'tree'), this.warn);
+    const main = join(this.directory, 'main'), entries = records(main, this.warn);
+    for (const name of logs(main)) this.lastSeenBytes.set(join(main, name), statSync(join(main, name)).size);
     // Memory checks the rest; a record without its text is as broken here as before.
     if (!entries.every(isEntry)) throw new Error('Invalid/noncontiguous OptChat log; refusing to change it.');
     if (!tree.every(isSummary)) throw new Error('Invalid OptChat summary record.');
-    for (const { i, text } of entries) this.texts[i] = text;
+    for (const { i, text, origin } of entries) this.texts[i] = origin ? text.replace(LEGACY_HEADER, '') : text;
     for (const { l, i, text } of tree) this.summaries.set(`${l}:${i}`, text);
     return { entries, tree, view: saved };
   }
@@ -88,7 +100,7 @@ export class FileStore implements Store {
     this.texts[entry.i] = entry.text;
   }
   private checkLog(next: string) {
-    const main = dirname(next), names = readdirSync(main).filter(n => n.endsWith('.jsonl'));
+    const main = dirname(next), names = logs(main);
     if (names.length !== this.lastSeenBytes.size || names.some(n => statSync(join(main, n)).size !== this.lastSeenBytes.get(join(main, n)))) throw otherWriter(next);
   }
   appendNode(node: Summary): undefined { appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), node); this.summaries.set(`${node.l}:${node.i}`, node.text); }
@@ -100,4 +112,21 @@ export class FileStore implements Store {
     const mimeType = file && MIMES.get(file.slice(name.length + 1));
     return file && mimeType ? { mimeType, data: readFileSync(join(this.directory, 'images', file)) } : undefined;
   }
+}
+/** A FileStore's directory as it is, for a process that must not change it: loading creates nothing, and every write is dropped. */
+export class FileReader extends FileStore {
+  override load() { return this.read(); }
+  override append(): undefined {}
+  override appendNode(): undefined {}
+  override saveView(): undefined {}
+  override putImage(): undefined {}
+}
+/** The image kept under `name` in the memory in `directory`, read without opening the memory. */
+export const readImage = (directory: string, name: string) => new FileReader(directory, () => {}).image(name);
+/** Changes whenever the memory in `directory` does: its logs only grow and its view is replaced. Images are left out: each is
+ * kept before the message that names it, under a name taken from its bytes, and never replaced, so a new one comes with a new message. */
+export function fingerprint(directory: string) {
+  const sizes = ['main', 'tree'].flatMap(sub => logs(join(directory, sub)).map(name => `${sub}/${name}:${statSync(join(directory, sub, name)).size}`));
+  const view = statSync(join(directory, 'view.json'), { throwIfNoEntry: false });
+  return [...sizes, `view:${view?.ino}:${view?.mtimeMs}`].join('|');
 }

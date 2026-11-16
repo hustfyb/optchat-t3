@@ -114,8 +114,9 @@ test('in an RPC host (Pi Web), /optchat profile <name> as the first message bind
 test('in an RPC host, /optchat profile <name> that cannot open saves no binding and blocks prompts instead of running without memory', async () => {
   const unlock = await lockProfile(profilePath('work'), 'work · PID 1 · elsewhere');
   try {
-    for (const [why, name, error] of [['typo', 'wrok', /does not exist/], ['busy', 'work', /Profile already running/]] as const) {
-      const pi = await headless('rpc');
+    // A busy profile joins as a connected window by default (rpc-window.test.ts); with --optchat-connect off it is refused.
+    for (const [why, name, error] of [['typo', 'wrok', /does not exist/], ['busy, --optchat-connect off', 'work', /Profile already running/]] as const) {
+      const pi = await headless('rpc', { connect: 'off' });
       try {
         await pi.ask(`/optchat profile ${name}`);
         assert.match(pi.notes.at(-1) ?? '', error, `${why}: the command says why`);
@@ -257,7 +258,7 @@ test('a profile another host creates during startup surfaces as its lock owner, 
   // hosts race. Afterwards the directory is visible, as it is once the other host's mkdir has returned.
   mock.method(fs, 'existsSync', (path: fs.PathLike) => String(path) === target && seen.n++ < 2 ? false : original(path));
   syncBuiltinESMExports();
-  const pi = await headless('rpc', { flag: 'auto', sessionId: id, cwd: dir });
+  const pi = await headless('rpc', { flag: 'auto', sessionId: id, cwd: dir, connect: 'off' });
   try {
     assert.equal(pi.errors.length, 1, 'the session start fails once');
     assert.match(String(pi.errors[0]), /Profile already running: .*PID 1/, 'the message names the host that holds the profile');

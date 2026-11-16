@@ -1,6 +1,6 @@
 import type { ImageContent, Message, TextContent, UserMessage } from '@earendil-works/pi-ai';
 import { CAP, cap, type Kind, type Memory } from './memory.ts';
-import { isImage } from './images.ts';
+import { isImage, refName } from './images.ts';
 
 /** A turn's messages as core reads them: pi-ai's, plus a host's own (Pi's custom messages), which pass through untouched. */
 export type AnyMessage = Message | { role: string; timestamp: number; content?: string | (TextContent | ImageContent)[] };
@@ -19,28 +19,47 @@ export function textContent(content: unknown, imageRef?: ImageRef): string {
     return '';
   }).filter(Boolean).join('\n');
 }
-/** Logs a message as the recipe's kinds: a user message as `kind` (`user`, or `work` for a subagent's report), a reply's text as
- * `talk`, its tool calls as `tool`, tool results and a failed reply as `echo`, each with `receipt`. Other roles are not logged. */
-export function logMessage(memory: Memory, message: AnyMessage, { kind = 'user', receipt, imageRef }: { kind?: Kind; receipt?: string; imageRef?: ImageRef } = {}) {
-  const date = new Date(message.timestamp).toISOString();
-  if (is(message, 'user')) memory.append(kind, textContent(message.content, imageRef), date, receipt);
+/** A message as the recipe's kinds: a user message as `kind` (`user`, or `work` for a subagent's report), a reply's text as `talk`,
+ * its tool calls as `tool`, tool results and a failed reply as `echo`. Other roles say nothing. */
+export function said(message: AnyMessage, { kind = 'user', imageRef }: { kind?: Kind; imageRef?: ImageRef } = {}) {
+  const lines: [Kind, string][] = [];
+  if (is(message, 'user')) lines.push([kind, textContent(message.content, imageRef)]);
   else if (is(message, 'assistant')) {
     for (const block of message.content) {
-      if (block.type === 'text' && block.text.trim()) memory.append('talk', block.text, date, receipt);
-      if (block.type === 'toolCall') memory.append('tool', `${block.name} ${JSON.stringify(block.arguments)}`, date, receipt);
+      if (block.type === 'text' && block.text.trim()) lines.push(['talk', block.text]);
+      if (block.type === 'toolCall') lines.push(['tool', `${block.name} ${JSON.stringify(block.arguments)}`]);
     }
     if (message.stopReason === 'error' || message.stopReason === 'aborted')
-      memory.append('echo', `Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`, date, receipt);
+      lines.push(['echo', `Agent ${message.stopReason}: ${message.errorMessage ?? 'No further details'}`]);
   } else if (is(message, 'toolResult'))
     // A zoom's page already names the images it returns.
-    memory.append('echo', cap(`${message.toolName}: ${textContent(message.content, message.toolName !== 'zoom' ? imageRef : undefined)}`), date, receipt);
+    lines.push(['echo', cap(`${message.toolName}: ${textContent(message.content, message.toolName !== 'zoom' ? imageRef : undefined)}`)]);
+  return lines;
 }
-/** A tool result over CAP keeps its head and tail, and its images. */
+/** Logs what a message `said`, each with `receipt`. */
+export function logMessage(memory: Memory, message: AnyMessage, { kind, receipt, imageRef }: { kind?: Kind; receipt?: string; imageRef?: ImageRef } = {}) {
+  const date = new Date(message.timestamp).toISOString();
+  for (const [k, text] of said(message, { kind, imageRef })) memory.append(k, text, date, receipt);
+}
+/** Ends a child conversation's first input, before its task. */
+export const TASK_HEADER = '\n\nYour task:\n';
+/** A child conversation's first input: the view, then optionally the exchange before the run and the run so far as `kind: text`
+ * lines (each image as `[image]`), then its task. With the view and task alone, it is what Pi's subagents get. */
+export function childInput({ view, previous = [], run = [], task }: { view: string; previous?: readonly AnyMessage[]; run?: readonly AnyMessage[]; task: string }) {
+  const part = (title: string, messages: readonly AnyMessage[]) => {
+    const lines = messages.flatMap(m => said(m, { imageRef: () => '[image]' })).map(([kind, text]) => `${kind}: ${text}`);
+    return lines.length ? [`${title}:\n${lines.join('\n')}`] : [];
+  };
+  return `${[view, ...part('The exchange before this run', previous), ...part('This run so far', run)].join('\n\n')}${TASK_HEADER}${task}`;
+}
+/** A text block that is only an image's ref, which a host may send in the image's place until the request is built (durable). */
+const isRef = (block: TextContent | ImageContent) => block.type === 'text' && refName(block.text) !== undefined;
+/** A tool result over CAP keeps its head and tail, and its images and their refs. */
 export function boundedMessage<M extends AnyMessage>(message: M): M {
   if (!is(message, 'toolResult')) return message;
-  const text = message.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+  const text = message.content.flatMap(c => c.type === 'text' && !isRef(c) ? [c.text] : []).join('\n');
   if (text.length <= CAP) return message;
-  return { ...message, content: [{ type: 'text', text: cap(text) }, ...message.content.filter(c => c.type === 'image')] };
+  return { ...message, content: [{ type: 'text', text: cap(text) }, ...message.content.filter(c => c.type === 'image' || isRef(c))] };
 }
 /** The view goes before the first user message's words, in that message, so everything up to them is one cached prefix. */
 export function withView<M extends AnyMessage>(messages: readonly M[], view: string): (M | UserMessage)[] {
@@ -52,6 +71,14 @@ export function withView<M extends AnyMessage>(messages: readonly M[], view: str
     const [first, ...rest] = typeof message.content === 'string' ? [{ type: 'text' as const, text: message.content }] : message.content;
     return { ...message, content: [{ type: 'text' as const, text: view }, ...first?.type === 'text' ? [{ ...first, text: `\n\n${first.text}` }] : first ? [first] : [], ...rest] };
   });
+}
+/** `withView` at the request sent at `anchor` (a timestamp), or the newest one when there is no anchor or it is gone (compacted away,
+ * say); `anchor` comes back as where the view went. Keeping it there while the view is unchanged keeps the rest cached. */
+export function placeView<M extends AnyMessage & { timestamp: number }>(messages: readonly M[], view: string, anchor?: number) {
+  const users = messages.flatMap((message, i) => is(message, 'user') ? [i] : []);
+  const at = users.find(i => messages[i].timestamp === anchor) ?? users.at(-1);
+  if (at === undefined) return { messages: [...messages], anchor };
+  return { messages: [...messages.slice(0, at), ...withView(messages.slice(at), view)], anchor: messages[at].timestamp };
 }
 /** A settled run's requests and its final text answer, for the previous exchange; none unless it ended in one. The caller supplies
  * a single settled run, including any steering after text-only replies. */
@@ -70,11 +97,12 @@ export function completedExchange(history: readonly AnyMessage[], imageRef?: Ima
 
 /** Pi's own estimate for an image when it decides to compact: 4,800 characters, about 1,200 tokens. */
 const IMAGE_CHARS = 4_800;
-/** Characters a message adds to a request: its text, thinking, tool-call arguments and images, as Pi estimates them. Framing is left out. */
+/** Characters a message adds to a request: its text, thinking, tool-call arguments and images (an image's ref too), as Pi estimates
+ * them. Framing is left out. */
 export function messageChars({ content = [] }: AnyMessage) {
   if (typeof content === 'string') return content.length;
   let sum = 0;
-  for (const block of content) sum += block.type === 'text' ? block.text.length : block.type === 'thinking' ? block.thinking.length
+  for (const block of content) sum += block.type === 'text' ? refName(block.text) === undefined ? block.text.length : IMAGE_CHARS : block.type === 'thinking' ? block.thinking.length
     : block.type === 'toolCall' ? JSON.stringify(block.arguments).length : block.type === 'image' ? IMAGE_CHARS : 0;
   return sum;
 }

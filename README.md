@@ -3,9 +3,10 @@
 # optchat-t3
 
 > **Fork of [pi-optchat](https://github.com/jonaslsaa/pi-optchat).** It adds per-session profiles for
-> [T3 Code](docs/t3-code.md) (`--optchat-profile auto`: one profile per thread, named after the whole session
-> id, and none for the `--no-session` runs T3 uses for its provider probe and one-off generation) and the
-> fixes for T3 replacing the session under a running extension. Everything else is upstream 0.11.0.
+> [T3 Code](docs/t3-code.md) (`--optchat-profile auto`: one profile per thread, named after the session id's
+> first and last twelve characters, and none for the `--no-session` runs T3 uses for its provider probe and
+> one-off generation) and the fixes for T3 replacing the session under a running extension. Everything else is
+> upstream 0.11.13.
 
 A Pi extension that gives you one endless chat per profile, remembered through a summary tree instead of compaction. It implements [Victor Taelin's OptChat recipe](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
 
@@ -41,13 +42,13 @@ To uninstall, run `pi remove git:github.com/jonaslsaa/pi-optchat`. Profile data 
 2. Choose **+ Create profile** and name it, for example `work`.
 3. Chat normally.
 
-The footer shows the active profile. Memory follows the profile across directories and Pi sessions. New sessions show the profile picker with the last-used profile first; resumed sessions restore their profile.
+The footer shows the active profile. Memory follows the profile across directories and Pi sessions. Resumed sessions restore their profile, and `/new` keeps the window's once its session has a message. Other new sessions open `OPTCHAT_PROFILE` if set (`OPTCHAT_PROFILE=work pi`, interactive Pi only), or your only profile, else show the picker with the last-used profile first. `/optchat profile` always shows the picker.
 
 ### Headless and RPC
 
-- `pi -p`, `--mode rpc` and other extensions' runners need `--optchat-profile work`. Without it (and without a saved profile in a resumed session) the run is plain Pi with no OptChat memory.
+- `pi -p`, `--mode rpc` and other extensions' runners need `--optchat-profile work`; `OPTCHAT_PROFILE` and a lone profile apply to interactive Pi only. Without it (and without a saved profile in a resumed session) the run is plain Pi with no OptChat memory.
 - In hosts that create sessions themselves (Pi Web), send `/optchat profile work` as the first message of a new session.
-- If the profile is open in another Pi, `pi -p` joins it as a connected window by default; `--optchat-connect auto|join|off` controls this.
+- If the profile is open in another Pi, `pi -p` joins it as a connected window by default, and so does an RPC session (one T3 Code thread or OptChat app window per process), with its agent running in its own process; `--optchat-connect auto|join|off` controls this.
 
 Details, errors and join rules: [docs/connected-windows.md](docs/connected-windows.md#headless-and-rpc-runs).
 
@@ -87,7 +88,7 @@ Details, errors and join rules: [docs/connected-windows.md](docs/connected-windo
 | Subagents | Anthropic Opus 5.5, high | `/optchat agents model` |
 | Compactor (summaries, imports, fallback handoffs) | Anthropic Sonnet 5.5, medium | `/optchat model` |
 
-All three are saved per profile. The main agent's model and thinking level are saved whenever you change them in Pi and picked again when the profile opens, unless the saved model is no longer available. This includes resumed sessions: the profile's pick replaces the one the session last used. On Pi's command line, `--model` (or `--provider`) keeps that model, `--thinking` that level, and `--models` keeps a saved model only if it is in that list. Subagent and compactor settings do not follow the main model. If you use other providers, change them before chatting. Authentication uses Pi's existing provider login.
+All three are saved per profile. The main agent's model and thinking level are saved when you first open the profile and whenever you change them in Pi, then picked again when the profile opens, unless the saved model is no longer available. This includes resumed sessions: the profile's pick replaces the one the session last used. On Pi's command line, `--model` (or `--provider`) keeps that model, `--thinking` that level, and `--models` keeps a saved model only if it is in that list. Subagent and compactor settings do not follow the main model. If you use other providers, change them before chatting. Authentication uses Pi's existing provider login.
 
 Compression and subagents make extra model requests with your provider credentials.
 
@@ -173,7 +174,7 @@ Pick the destination profile, then run `/optchat import`.
 3. **Mode** (only if the profile already has history): **Append** keeps existing summaries and adds the import (faster, cheaper); **Rebuild by conversation start date** regenerates the whole tree.
 4. **Preview**: destination, new and duplicate counts, text size, rough token estimate, and compactor. A big import costs about 3x that estimate in compactor input.
 
-- Only user messages and final assistant replies come in, with original dates and source labels, marked as historical so old requests are not treated as new instructions. Tool calls, reasoning and file bytes are left out.
+- Only user messages and final assistant replies come in, with original dates, one note per conversation, marked `[IMP <day>]` so old requests are not treated as new instructions. Tool calls, reasoning and file bytes are left out.
 - Re-importing skips messages already present.
 - **Pause import** (or Escape, or restarting Pi) saves progress; `/optchat import` then offers **Resume** or **Discard staged import**. Chat in that profile is blocked while an import is pending.
 - Imports switch to the new memory only when the whole tree is ready; the previous one stays on disk. Source files are never modified.
@@ -241,7 +242,7 @@ Pipe names and permissions: [docs/storage.md](docs/storage.md#windows-difference
 - **Use worktrees** when parallel agents edit the same repository; they share the filesystem.
 - **Instructions**: the main agent and subagents get Pi's usual global and repository `AGENTS.md` files and your skills, followed by the profile's `AGENTS.md`, which comes last and wins. OptChat replaces only Pi's opening prompt. Prompt templates work in the main session only.
 - **Tab title**: `π personal` while waiting for you, `● π personal` while the agent works, plus `· 2 agents` while subagents run. A connected window shows `↳ personal`, `● ↳ personal`, then `↳ personal · done` or `↳ personal · disconnected`. OptChat replaces Pi's default title and puts its own back when Pi resets it (new session, reload, rename).
-- **Images** you paste, or a tool returns, are kept under the profile's `images/` (once each, shrunk to 2,048 px on the long side and about 1.5 MB with Pi's own resizer; smaller ones stay as they are). The log names each as `[image <hash>]`, and `zoom(id, 1)` returns a message's images with its text. Summaries stay text. Imported conversations keep a text placeholder.
+- **Images** you paste, or a tool returns, are kept under the profile's `images/` (once each, shrunk to 2,048 px on the long side and about 1.5 MB with Pi's own resizer; smaller ones stay as they are). The log names each as `[image <hash>]`, and `zoom(id, 1)` returns a message's images with its text. A message's own summary is written with its images in view (short ones too, if the compactor's model takes images), so it says what they show; summaries stay text. Imported conversations keep a text placeholder.
 - **Long turns** (#146): Pi's auto-compaction is off for the main agent, since memory replaces it. Once the current turn's verbatim messages pass the Turn refresh threshold (30% of the model's window by default), they are flushed to memory, the view is rebuilt, and only the task message plus the last tool call and its result stay verbatim; the earlier steps are the view's last lines, a zoom away. In an A/B on a 200K model, turns that otherwise gave up around 100K tokens kept going and covered the whole task. `OPTCHAT_REFRESH_AT` (a fraction, e.g. `0.3`; `0` is off) overrides the setting. Subagents use Pi's own compaction instead, starting at about the same point.
 - **Restarts**: unsent inputs are recovered into memory, and pending subagent reports are delivered.
 - **Prompt-template inputs** can be saved twice: expanded, and later in their original form as an unanswered input, because Pi expands them after the input journal records them. Skill commands (`/skill:name`) are matched back to their journaled input and don't have this problem. Plain text chat is unaffected.

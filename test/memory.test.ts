@@ -13,9 +13,10 @@ import { appendJson, localDay } from '../src/store.ts';
 import { lockProfile } from '../src/profiles.ts';
 import { splitView, cachePayload } from '../src/core/cache.ts';
 import { logMessage, buildContext } from '../src/transcript.ts';
-import { boundedMessage } from '../src/core/messages.ts';
+import { boundedMessage, placeView } from '../src/core/messages.ts';
 import { Inbox } from '../src/inbox.ts';
 import { compaction } from '../src/core/prompts.ts';
+import { searchPage } from '../src/core/tools.ts';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import type { AssistantMessage, SystemMessage, UserMessage } from '@earendil-works/pi-ai';
 import { removeDir } from './support.ts';
@@ -944,4 +945,39 @@ test("a tool result's summary sees the raw call it answers, paired in order thro
     assert.doesNotMatch(compaction(leaf(1)), /<call>/);
     assert.doesNotMatch(leaf(4).context, /tool: bash/);
   } finally { await memory.close(); removeDir(dir); }
+});
+
+test('an imported message reads as [IMP <day>] in its leaf, zoom and search, and loading drops an older import\'s header line', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
+  const origin = { source: 'claude', conversation: 'c', message: 'm', title: 'Old chat' }, date = '2026-04-08T10:00:00.000Z';
+  const texts = ['kept verbatim',
+    '[Historical claude · 2026-04-08T10:00:00.000Z · conversation 5f130903-c124-41f6-98e0-db2e60847012 · Old chat]\nstored by an older import',
+    '[Historical codex · 2026-04-08 10:00Z · 0199c0de-1111 · Old · chat]\nstored by a later import',
+    // A Claude Code memory note's line names the memory, and a message that itself starts "[Historical" is the user's text: both stay.
+    '[Historical Claude Code memory · 2026-04-08 10:00Z · project /p · Deploys]\nNever on Fridays',
+    '[Historical context]\nbody'];
+  mkdirSync(join(dir, 'main'), { recursive: true });
+  writeFileSync(join(dir, 'main', '000-import.jsonl'), texts.map((text, i) => JSON.stringify({ i, kind: 'user', text, date, receipt: `import:${i}`, origin })).join('\n') + '\n');
+  const memory = new Memory(dir, async input => input.source);
+  try {
+    memory.append('user', 'native');
+    await memory.settle(AbortSignal.timeout(5000), 'tree');
+    assert.deepEqual([0, 1, 2, 3, 4].map(i => memory.text(i)), ['kept verbatim', 'stored by an older import', 'stored by a later import', texts[3], texts[4]]);
+    assert.deepEqual(memory.render().split('\n').slice(1, 3), ['0+1|[IMP 2026-04-08] user: kept verbatim', '1+1|[IMP 2026-04-08] user: stored by an older import']);
+    assert.equal(memory.zoom(5, 1), '5+1|user: native');
+    assert.equal(memory.zoom(1, 1), '1+1|[IMP 2026-04-08] user: stored by an older import');
+    assert.match(searchPage(memory, 'older import'), / · \[IMP 2026-04-08\] user: stored by an older import$/m);
+  } finally { await memory.close(); removeDir(dir); }
+});
+
+test('placeView puts the view at its anchored request, else at the newest one, and says where it went', () => {
+  const user = (text: string, timestamp: number) => ({ role: 'user' as const, content: text, timestamp });
+  const messages = [user('one', 1), user('two', 2)], text = (m: { content: unknown }) => JSON.stringify(m.content);
+  const fresh = placeView(messages, 'VIEW');
+  assert.equal(fresh.anchor, 2);
+  assert.ok(text(fresh.messages[1]).includes('VIEW') && !text(fresh.messages[0]).includes('VIEW'));
+  const kept = placeView([...messages, user('three', 3)], 'VIEW', 2);
+  assert.equal(kept.anchor, 2, 'an unchanged view stays put');
+  assert.ok(text(kept.messages[1]).includes('VIEW') && !text(kept.messages[2]).includes('VIEW'));
+  assert.equal(placeView([user('three', 3)], 'VIEW', 2).anchor, 3, 'an anchor compacted away moves to the newest request');
 });

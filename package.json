@@ -99,6 +99,7 @@
     "docs/*.md",
     "README.md",
     "LICENSE",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "scripts"
   ]
 }

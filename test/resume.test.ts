@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from '@earendil-works/pi-coding-agent';
 import { Children } from '../src/agents.ts';
+import { resumeCutOff } from '../src/files.ts';
+import { serveWindows } from '../src/window-bridge.ts';
 import { Memory } from '../src/memory.ts';
 import type { Settings } from '../src/settings.ts';
 import { emptyUsage } from '../src/usage.ts';
@@ -344,6 +346,44 @@ test('subagents cut off by Pi closing or crashing are resumed at the next start,
     assert.equal(reports.length, told, 'nothing left to resume, nothing to say');
     assert.deepEqual(warnings, []);
   } finally { await cleanup(first, ...later); }
+});
+
+test('the profile socket resumes the cut-off subagents once asked, and the main agent is told once', async () => {
+  const { dir, releases, reports, make, cleanup } = await setup('optchat-resume-socket-');
+  const first = make('first-session');
+  let later: Children | undefined, close: (() => Promise<void>) | undefined;
+  try {
+    const [held] = await first.spawn([{ task: 'hold on' }], dir);
+    await until(() => releases.has('hold on'));
+    await first.close();
+    reports.length = 0;
+    later = make('rpc-session');
+    // The owner serves the profile's socket; the run stays cut off until its host says so.
+    close = await serveWindows(dir, later, () => true, async () => {});
+    assert.equal(later.history.records.get(held)?.cutOff, true);
+    await resumeCutOff(dir);
+    assert.equal(later.history.records.get(held)?.cutOff, undefined, 'resumed by the time the call returns');
+    assert.deepEqual(reports.filter(r => !r.startsWith(`[${held}]`)), [`Pi restarted while subagents were working. Resumed ${held} from where it left off; reports arrive as usual.`]);
+    await until(() => later!.history.records.get(held)?.state === 'completed');
+    const told = reports.length;
+    await resumeCutOff(dir);
+    assert.equal(reports.length, told, 'a second go-ahead finds nothing cut off');
+  } finally { await close?.(); await cleanup(first, ...later ? [later] : []); }
+});
+
+test('two resumes of the cut-off subagents at once (a start and a host, two pages) resume each once, and the main agent is told once', async () => {
+  const { dir, releases, reports, make, cleanup } = await setup('optchat-resume-twice-');
+  const first = make('first-session');
+  let later: Children | undefined;
+  try {
+    const [held] = await first.spawn([{ task: 'hold on' }], dir);
+    await until(() => releases.has('hold on'));
+    await first.close();
+    reports.length = 0;
+    later = make('second-session');
+    await Promise.all([later.resumeCutOff(), later.resumeCutOff()]);
+    assert.deepEqual(reports.filter(r => !r.startsWith(`[${held}]`)), [`Pi restarted while subagents were working. Resumed ${held} from where it left off; reports arrive as usual.`]);
+  } finally { await cleanup(first, ...later ? [later] : []); }
 });
 
 test('with grouped reports, the main agent is told that resumed subagents now report on their own', async () => {

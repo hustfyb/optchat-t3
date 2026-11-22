@@ -1,9 +1,9 @@
 import {
   AssistantEntry, CompactionTask, defineExtension, defineTask, defineTool, GenerationTask, hook, InboxDoc, LiveDoc, ResetEntry, ROOT_CONVERSATION_ID,
   section, ToolResultEntry, ToolTask, UserEntry, type Conversation, type ConversationId, type EntryId, type EntryRecord, type GenerationHooks, type Harness,
-  type HarnessOptions, type ToolExecutionResult, type ToolHooks, type UserInput,
+  type HarnessOptions, type ToolExecutionResult, type ToolHooks, type ToolRegistration, type UserInput,
 } from '@earendil-works/pi-durable';
-import type { Static, TSchema } from 'typebox';
+import type { TSchema } from 'typebox';
 import {
   allowSearch, boundedMessage, cachePayload, CHILD, childInput, completedExchange, CONTINUITY, isImage, logMessage, memoryTools, refreshBudget, refreshedRun,
   refreshPoint, SEARCH_DOC, searchTool, textContent, TURN_REFRESHED, VIEW_DOC, withView, type Memory,
@@ -29,7 +29,7 @@ const encoder = new TextEncoder();
 /** One of core's memory tools as a Pi Durable tool, its arguments typed by its own schema. */
 const durableTool = <P extends TSchema>(tool: {
   name: string; description: string; parameters: P;
-  execute: (callId: string, args: Static<P>) => Promise<{ content: ToolExecutionResult['output'] }>;
+  execute: (callId: string, args: Parameters<ToolRegistration<P>['execute']>[0]) => Promise<{ content: ToolExecutionResult['output'] }>;
 }) => defineTool({
   name: tool.name, description: tool.description, parameters: tool.parameters, replay: 'safe',
   execute: async (args, api) => ({ output: (await tool.execute(api.callId, args)).content }),
@@ -207,6 +207,10 @@ export function optchat({ memory, conversation: id = ROOT_CONVERSATION_ID, promp
     // Images go back in last, into only what is sent: a refresh drops older steps' refs unread.
     return system.length < request.messages.length ? { messages: withView(await restore(memory.store, [...system, ...previous, ...run]), view) } : undefined;
   };
+  /** OptChat's cache marks on every Anthropic request body, a child's too: in blocks of 4 lines, so a view that grows at its end is
+   * read from the cache (pi-ai's own marks miss it). A request without a view keeps pi-ai's marks. */
+  const beforeProviderRequest: GenerationHooks['beforeProviderRequest'] = ({ model, payload }) =>
+    model.api === 'anthropic-messages' ? { payload: cachePayload(payload) } : undefined;
 
   const Remember = defineTask<Record<string, never>, { phase: 'remember' }, null>({
     name: 'optchat.remember', version: 1,
@@ -260,7 +264,7 @@ export function optchat({ memory, conversation: id = ROOT_CONVERSATION_ID, promp
       name: 'optchat',
       tools,
       sections: [section('optchat', ({ conversationId }) => conversationId === id ? text : childPrompt, { tag: false })],
-      hooks: [hook(GenerationTask, { beforeRequest }), hook(ToolTask, { afterTool }), hook(CompactionTask, { beforeCompact: (_compaction, api) => api.conversationId === id ? { decline: true } : undefined })],
+      hooks: [hook(GenerationTask, { beforeRequest, beforeProviderRequest }), hook(ToolTask, { afterTool }), hook(CompactionTask, { beforeCompact: (_compaction, api) => api.conversationId === id ? { decline: true } : undefined })],
       tasks: [Remember],
     }),
     /** The first input of a child conversation that sees OptChat's memory as the conversation's next request would: the view (with
@@ -280,9 +284,9 @@ export function optchat({ memory, conversation: id = ROOT_CONVERSATION_ID, promp
     /** Starts following the conversation, and resets it now if a run ended before a restart. Returns a function that stops. */
     attach(harness: Harness, ctx: Context) {
       attached.set(harness, ctx);
-      const stop = harness.subscribeCommits(() => void schedule());
+      const commits = harness.observeCommits({ advance: () => void schedule(), end: () => {} });
       void schedule();
-      return stop;
+      return () => commits.detach();
     },
   };
 }
@@ -297,17 +301,7 @@ export function attachment(name: string) {
   };
 }
 
-/** Pi Durable's `Models` with OptChat's cache marks on Anthropic requests that carry a view: in blocks of 4 lines, so a view that
- * grows at its end is read from the cache (pi-ai's own marks miss it). A request that sets its own `onPayload` is left alone, as
- * the compactor's are. A Proxy, since `createModels()` returns a class instance whose methods a spread would lose. */
+/** @deprecated The `optchat` extension adds OptChat's cache marks itself now; this returns `models` unchanged. It goes away in 0.13.0. */
 export function withCacheMarks<M extends Models>(models: M): M {
-  return new Proxy(models, {
-    get(target, key) {
-      const value: unknown = Reflect.get(target, key, target);
-      if (key !== 'streamSimple') return typeof value === 'function' ? value.bind(target) : value;
-      const stream: Models['streamSimple'] = (model, request, options) => target.streamSimple(model, request,
-        options?.onPayload || model.api !== 'anthropic-messages' ? options : { ...options, onPayload: payload => cachePayload(payload) });
-      return stream;
-    },
-  });
+  return models;
 }

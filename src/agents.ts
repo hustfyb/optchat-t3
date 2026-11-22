@@ -5,12 +5,13 @@ import { homedir } from 'node:os';
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, getAgentDir, type AgentSession, type AgentSessionEvent, type ExtensionAPI, type InlineExtension, type ModelRegistry } from '@earendil-works/pi-coding-agent';
 import * as sdk from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import { StringEnum, type Api, type Model } from '@earendil-works/pi-ai';
+import type { Api, Model } from '@earendil-works/pi-ai';
 import { allowSearch, SEARCH_DOC, VIEW_DOC } from './core/prompts.ts';
 import { windowHandoff, CONNECTED, cutOffChildren, delegation, NO_DELEGATION, NOT_CONNECTED, RESTARTED, STEERABLE, SUBAGENT } from './prompts.ts';
 import { memoryTools } from './tools.ts';
 import { searchTool } from './core/tools.ts';
 import { VIEW } from './core/memory.ts';
+import { noteLimits, noteRefusal } from './limits.ts';
 import type { Memory } from './memory.ts';
 import type { ModelChoice } from './profiles.ts';
 import { cachePayload } from './core/cache.ts';
@@ -52,6 +53,8 @@ const STOPPED: Record<StopCause, string> = {
 };
 const stoppedReport = (cause: StopCause, text = '') => `${STOPPED[cause]}${text ? `\n\nIts last message before the stop:\n${text}` : ''}`;
 interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
+  /** The profile's folder where the children's answers keep the subscription's limits (limits.ts): the headers of each, and the refusal one ends in. */
+  limits?: string;
   /** Names of the built-in extensions the main session loaded (see `loadedBuiltins`). */
   builtins?: () => Iterable<string>;
   /** Journals the reports a main-agent spawn has so far while its other children still run (none: the batch was delivered), so a crash cannot lose them. */
@@ -82,13 +85,15 @@ const CWD_DOC = 'Project directory the subagent works in (~ allowed); its AGENTS
 /** The spawn tools' tasks. What a task leaves out of model and thinking is the profile's subagent choice. */
 export const TASKS = Type.Array(Type.Object({ task: Type.String(), title: Type.Optional(Type.String({ description: TITLE_DOC })), cwd: Type.Optional(Type.String({ description: CWD_DOC })),
   model: Type.Optional(Type.String({ description: 'Leave unset for the profile\'s subagent model (named in your instructions). Set only when the user asks for a model, as provider/id from models().' })),
-  thinking: Type.Optional(StringEnum(THINKING, { description: 'Leave unset for the profile\'s subagent level. Set only when the user asks for one.' })) }), { minItems: 1 });
+  thinking: Type.Optional(Type.Unsafe<typeof THINKING[number]>({ type: 'string', enum: [...THINKING], description: 'Leave unset for the profile\'s subagent level. Set only when the user asks for one.' })) }), { minItems: 1 });
 export type Task = Static<typeof TASKS>[number];
+/** `quiet`: the main agent reads the report on its next turn instead of taking one for it. */
+export type ReportOptions = { once?: boolean; count?: number; quiet?: boolean };
 /** The tool beside spawn that lists what a task's `model` may be. */
-export const modelsTool = (children: () => Children) => ({ name: 'models', label: 'List models',
+export const modelsTool = (list: (provider?: string) => string | Promise<string>) => ({ name: 'models', label: 'List models',
   description: 'The models a spawn task may name, as provider/id, with the profile\'s subagent default marked. provider narrows the list to one provider.',
   parameters: Type.Object({ provider: Type.Optional(Type.String()) }),
-  execute: async (_id: string, args: { provider?: string }) => result(children().models(args.provider)) });
+  execute: async (_id: string, args: { provider?: string }) => result(await list(args.provider)) });
 const isOptchat = (path: string) => packageName(path) === 'pi-optchat';
 
 // Pi's CLI adds its built-in extensions (MCP, codemode, tool search) to its own session; SDK sessions such as
@@ -135,8 +140,12 @@ const interruptedWith = (texts: string[]) => `${INTERRUPTED}${texts.join('\n\n')
 export function refreshContextFiles(options: { contextFiles: Array<{ path: string; content: string }> }) {
   options.contextFiles = options.contextFiles.flatMap(({ path }) => { try { return [{ path, content: readFileSync(path, 'utf8') }]; } catch { return []; } });
 }
+/** How far a run nests below a chat the user talks to. A connected window is such a chat, like the main one: its record says depth 1, its children are level 1 too. */
+const level = ({ depth, connected }: Pick<RunInfo, 'depth' | 'connected'>) => connected ? depth - 1 : depth;
 export class Children {
   private readonly running = new Map<string, LiveRun>();
+  /** Windows in their own Pi that are connected now, by run ID: see connectWindow(). */
+  private readonly windows = new Map<string, (text: string) => boolean>();
   readonly history: RunHistory;
   private readonly listeners = new Set<() => void>();
   private closing = false;
@@ -150,7 +159,7 @@ export class Children {
   private readonly deferring = new AbortController();
   constructor(private readonly memory: Memory, private readonly registry: ModelRegistry,
     private readonly choice: () => ModelChoice, private readonly instructions: () => string,
-    private readonly report: (text: string, options?: { once?: boolean; count?: number }) => Promise<void>, private readonly warn: (text: string) => void,
+    private readonly report: (text: string, options?: ReportOptions) => Promise<void>, private readonly warn: (text: string) => void,
     private readonly profileDirectory = memory.directory, private readonly options: Options = {}) {
     this.history = new RunHistory(profileDirectory);
     for (const warning of this.history.warnings) warn(warning);
@@ -218,6 +227,7 @@ export class Children {
         live.streaming = undefined;
       }
       if (event.type === 'turn_end' || event.type === 'agent_settled') this.options.usage?.backfill(live.session.sessionManager.getEntries(), live.info.parentSession, 'subagent', live.info.id);
+      if (event.type === 'turn_end' && event.message.role === 'assistant' && this.options.limits) noteRefusal(this.options.limits, event.message.errorMessage);
       if (event.type === 'message_start' && event.message.role === 'user') {
         const text = textContent(event.message.content);
         const guidance = live.prompting ?? live.info.guidance.find(g => g.state === 'queued' && sentText(g) === text);
@@ -252,10 +262,10 @@ export class Children {
     if (this.closing) throw new Error('Profile is closing.');
     this.settling++;
     try { await this.memory.settle(signal); } finally { this.settling--; }
-    const parent = parentId ? this.running.get(parentId) : undefined;
-    const cancelled = () => this.closing || (parentId !== undefined && this.running.get(parentId)?.info.state !== 'running');
-    if (parentId && (!parent || parent.info.state !== 'running')) throw new Error('The parent is no longer running.');
-    const depth = parent ? parent.info.depth + 1 : 1;
+    const parent = parentId ? this.parentRun(parentId) : undefined;
+    const cancelled = () => this.closing || (parentId !== undefined && this.parentRun(parentId)?.state !== 'running');
+    if (parentId && (!parent || parent.state !== 'running')) throw new Error('The parent is no longer running.');
+    const depth = parent ? level(parent) + 1 : 1;
     const { subagentLevels, maxAgents, groupReports } = this.settings;
     if (depth > subagentLevels) throw new Error(`Delegation depth limit reached: this profile allows ${subagentLevels} level${subagentLevels === 1 ? '' : 's'} of subagents.`);
     if (this.closing) throw new Error('Profile is closing.');
@@ -325,7 +335,7 @@ export class Children {
   private async open(o: { id: string; directory: string; depth: number; parentId?: string; connected: boolean; model: Model<Api>;
     thinking?: ModelChoice['thinking']; sessionManager: SessionManager }) {
     const { id, directory, depth, parentId, connected } = o;
-    const { subagentLevels, maxAgents, memorySearch } = this.settings, delegates = depth < subagentLevels;
+    const { subagentLevels, maxAgents, memorySearch } = this.settings, delegates = level({ depth, connected }) < subagentLevels;
     // The user's settings list their installed packages; a copy in memory keeps the child from writing them back.
     const settingsManager = SettingsManager.inMemory({ ...SettingsManager.create(directory, getAgentDir()).getSettings(),
       compaction: subagentCompaction(o.model.contextWindow, refreshFraction(this.settings.refreshAt)), cacheWarming: 'off' });
@@ -348,12 +358,13 @@ export class Children {
           if (live && primed) { live.primed = undefined; await abortable(primed, ctx.signal); }
           return ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload;
         });
+        pi.on('after_provider_response', event => { if (this.options.limits) noteLimits(this.options.limits, event.headers); });
       }],
     });
     await loader.reload();
     const { session } = await (this.options.createSession ?? createAgentSession)({ cwd: directory, resourceLoader: loader, settingsManager,
       model: o.model, thinkingLevel: o.thinking, sessionManager: o.sessionManager,
-      customTools: [...memoryTools(() => this.memory, run => this.transcript(run, id)), ...(memorySearch ? [searchTool(() => this.memory)] : []), ...(delegates ? [...this.delegationTools(id, directory, subagentLevels, maxAgents), modelsTool(() => this)] : []), this.parentTool(id, parentId, connected)],
+      customTools: [...memoryTools(() => this.memory, run => this.transcript(run, id)), ...(memorySearch ? [searchTool(() => this.memory)] : []), ...(delegates ? [...this.delegationTools(id, directory, subagentLevels, maxAgents), modelsTool(provider => this.models(provider))] : []), this.parentTool(id, parentId, connected)],
       excludeTools: delegates ? [] : ['spawn', 'tell', 'models'],
     });
     // Callers track the session only after this returns: clean up here if its extensions fail to start.
@@ -367,10 +378,7 @@ export class Children {
       execute: async (_id: string, args: { tasks: Task[] }, signal?: AbortSignal) => result(await this.start(args.tasks, cwd, signal, parentId)),
     }, { name: 'tell', label: 'Guide child', description: 'Send guidance to one of your direct children. A finished child is resumed with its earlier conversation, and its new report arrives automatically.',
       parameters: Type.Object({ id: Type.String(), message: Type.String() }),
-      execute: async (_id: string, args: { id: string; message: string }) => {
-        if (this.history.records.get(args.id)?.parentId !== parentId) throw new Error('You can only guide your own children.');
-        return result(await this.tell(args.id, args.message, 'manager', parentId));
-      },
+      execute: async (_id: string, args: { id: string; message: string }) => result(await this.guide(parentId, args.id, args.message)),
     }];
   }
   /** Lets a child message its parent mid-run, the way tell lets the parent guide it. */
@@ -386,9 +394,42 @@ export class Children {
       },
     };
   }
+  /** A parent agent's tell to one of its own children. */
+  async guide(parentId: string, id: string, message: string) {
+    if (this.history.records.get(id)?.parentId !== parentId) throw new Error('You can only guide your own children.');
+    return this.tell(id, message, 'manager', parentId);
+  }
+  /** A parent that takes its children's reports: a live run here, or a window in its own Pi while its socket is open. */
+  private parentRun(id: string) { return this.running.get(id)?.info ?? (this.windows.has(id) ? this.history.records.get(id) : undefined); }
+  /**
+   * Opens the way to a window in its own Pi (see serveWindows): its children's reports and messages go through `send`, which
+   * says false once the window can't take them. Returns the close.
+   */
+  connectWindow(id: string, send: (text: string) => boolean) {
+    this.windows.set(id, send);
+    void this.cutOffUnder(id, true).catch(error => this.warn(`Could not tell window ${id} about its stopped subagents: ${String(error)}`));
+    return () => { if (this.windows.get(id) === send) this.windows.delete(id); };
+  }
+  /** A window's subagents that a Pi restart cut off (see resumeCutOff), named once it reconnects, whose tell resumes them (they stay
+   * cut off till then, so their own cut-off agents are named to them as they resume), or once it has ended to the main chat. */
+  private async cutOffUnder(id: string, open: boolean) {
+    const cut = [...this.history.records.values()].filter(run => run.parentId === id && run.cutOff);
+    if (!cut.length) return;
+    if (!open) for (const run of cut) { delete run.cutOff; this.save(run); }
+    const ids = cut.map(run => run.id).join(', ');
+    await this.toWindow(id, open ? `Pi restarted while your subagents ${ids} were working, so they stopped. tell resumes one where it left off if you still need its result.`
+      : `Pi restarted while subagents ${ids} of connected window ${id} were working, so they stopped. The window ended before it could resume them; spawn new ones if their work is still needed.`);
+  }
+  /** A report or message for a window in its own Pi: to it while it is open, else to the main chat, saying whose it was. */
+  private async toWindow(id: string, text: string, count?: number) {
+    const window = this.history.records.get(id);
+    if (window && runsElsewhere(window) && this.windows.get(id)?.(text)) return;
+    await this.report(`${text}\n\n(For connected window ${id}, which has ended, so it reaches you instead.)`, { count });
+  }
   /** A mid-run message to a child's parent: false if that parent is no longer running. */
   private async toParent(parentId: string | undefined, text: string) {
     if (!parentId) { await this.report(text); return true; }
+    if (this.history.records.get(parentId)?.window) { await this.toWindow(parentId, text); return true; }
     const parent = this.running.get(parentId);
     if (!parent || !['running', 'waiting', 'paused'].includes(parent.info.state)) return false;
     if (parent.info.state === 'running') await this.steer(parent, text);
@@ -407,7 +448,7 @@ export class Children {
   private async execute(live: LiveRun, prompt: string) {
     const { session, info } = live;
     try {
-      if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${info.task}\n\nUse tell with this agent ID only if you know something it needs. It stays open between replies and sends a final handoff on completion or disconnect.`);
+      if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${info.task}\n\nUse tell with this agent ID only if you know something it needs. It stays open between replies and sends a final handoff on completion or disconnect.`, { quiet: true });
       // A stop that lands before the first prompt has no turn to abort, so it is honoured here.
       const state: RunState = info.state; // a local, so the loop below still sees later state changes
       if (this.closing || info.handoff || state === 'stopping') throw new Error('Stopped before its first request.');
@@ -526,7 +567,7 @@ export class Children {
       if (texts.length < batch.ids.length) { if (!info.parentId) this.options.hold?.(batch.ids[0], texts); return; }
       text = texts.join('\n\n'); count = texts.length;
     }
-    if (info.parentId) {
+    if (info.parentId && !this.history.records.get(info.parentId)?.window) {
       const parent = this.running.get(info.parentId);
       // A connected parent that is ending still keeps the reports of children that finished on their own: its handoff includes
       // them. Its stopped children are named there instead.
@@ -538,7 +579,7 @@ export class Children {
       return;
     }
     if (this.closing) this.memory.append('work', text);
-    else try { await this.report(text, { count }); }
+    else try { await (info.parentId ? this.toWindow(info.parentId, text, count) : this.report(text, { count })); }
     catch (error) {
       this.memory.append('work', text);
       this.warn(`Subagent report saved but could not wake the parent: ${String(error)}`);
@@ -635,8 +676,9 @@ export class Children {
     if (!['completed', 'failed', 'stopped', 'interrupted'].includes(run.state) || this.resuming.has(id)) throw new Error(`${id} is still finishing. Its report will arrive on its own.`);
     if (run.parentId !== caller) {
       if (!run.parentId) throw new Error(`Only the main agent can resume ${id}.`);
-      const parent = this.running.get(run.parentId);
-      throw new Error(parent && ['running', 'waiting', 'paused'].includes(parent.info.state) ? `Only ${id}'s parent ${run.parentId} can resume it. Ask ${run.parentId} with tell.`
+      const parent = this.parentRun(run.parentId), window = this.history.records.get(run.parentId)?.connected;
+      throw new Error(parent && ['running', 'waiting', 'paused'].includes(parent.state) ? `Only ${id}'s parent ${run.parentId} can resume it.${window ? '' : ` Ask ${run.parentId} with tell.`}`
+        : window ? `Only ${id}'s parent, connected window ${run.parentId}, could resume it, and that window has ended. Spawn a new subagent instead.`
         : `Only ${id}'s parent ${run.parentId} can resume it, and that parent is no longer running. Resume ${run.parentId} instead, or spawn a new subagent.`);
     }
     if (this.closing) throw new Error('Profile is closing.');
@@ -652,8 +694,8 @@ export class Children {
       // No thinking level: the session restores the one it ran with.
       const session = await this.open({ id, directory: run.cwd, depth: run.depth, parentId: run.parentId, connected: false, model, sessionManager: manager });
       // stop() cannot see this child until it is registered, so a parent stopped meanwhile must cancel it here.
-      const parent = run.parentId ? this.running.get(run.parentId) : undefined;
-      if (this.closing || run.parentId && (!parent || !['running', 'waiting', 'paused'].includes(parent.info.state))) {
+      const parent = run.parentId ? this.parentRun(run.parentId) : undefined;
+      if (this.closing || run.parentId && (!parent || !['running', 'waiting', 'paused'].includes(parent.state))) {
         await this.shutdown(session); this.dispose(session); throw new Error('Parent or profile is stopping.');
       }
       // The finished record stays untouched (and resumable) unless the new one is saved.
@@ -692,6 +734,9 @@ export class Children {
     for (const id of cut) {
       const run = current(id);
       if (!run) continue;
+      // A window in its own Pi still open hears of it when it registers again, or the main chat when it ends (cutOffUnder).
+      const window = run.parentId ? this.history.records.get(run.parentId) : undefined;
+      if (window && runsElsewhere(window)) continue;
       if (run.parentId) {
         // Its parent was not cut off (it was paused, say) or could not be resumed: nobody else will mention it.
         if (!this.history.records.get(run.parentId)?.cutOff && !this.running.has(run.parentId)) { orphans.push(`${run.id} (under ${run.parentId})`); drop(run); }
@@ -700,7 +745,7 @@ export class Children {
       try { await this.track(this.resume(id, RESTARTED)); resumed.push(id); }
       catch (error) {
         const still = current(id);
-        if (!still) continue; // Resumed by someone else meanwhile.
+        if (!still || this.resuming.has(id)) continue; // Resumed by someone else meanwhile, or being resumed now.
         lines.push(`Could not resume ${id}: ${error instanceof Error ? error.message : String(error)}`); drop(still);
       }
     }
@@ -722,13 +767,13 @@ export class Children {
    * Registers a connected window whose agent runs in its own Pi process, or takes back one an earlier owner registered
    * (see `RunInfo.window`). Its agent loop, tools and transcript stay there; this process keeps its record and delivers its handoff.
    */
-  async adopt(window: RemoteWindow, { quiet = false } = {}) {
+  async adopt(window: RemoteWindow, { announce = true } = {}) {
     const { id, task, cwd, model, thinking, title, pid, session, after } = window, known = this.history.records.get(id);
     if (known && !runsElsewhere(known)) throw new Error(`${id} is already a run in this profile`);
     const where = { pid, session, after };
     this.save(known ? { ...known, window: where } : { id, task, cwd, model, thinking, ...(title ? { title } : {}), parentSession: this.options.parentSession ?? '',
       depth: 1, started: Date.now(), state: 'running', guidance: [], connected: true, window: where });
-    if (!known && !quiet) await this.report(`[${id}] User started a connected conversation in ${cwd}, in a Pi window of its own. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${task}\n\nIt runs in another Pi process, so tell can't reach it. It sends a final handoff on completion or disconnect.`);
+    if (!known && announce) await this.report(`[${id}] User started a connected conversation in ${cwd}, in a Pi window of its own. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${task}\n\nIt runs in another Pi process, so tell can't reach it. It sends a final handoff on completion or disconnect.`, { quiet: true });
   }
   /** A window in its own process has ended. `written`: the handoff it wrote itself (/complete); without one the compactor writes it from the window's transcript. */
   async endRemote(id: string, reason: FinishReason, written?: string) {
@@ -737,7 +782,7 @@ export class Children {
     run.handoff = { reason }; run.ended = Date.now();
     transition(run, reason === 'complete' ? 'completed' : 'interrupted');
     this.save(run);
-    const work = this.deliverHandoff(run, undefined, written);
+    const work = this.deliverHandoff(run, undefined, written).then(() => this.cutOffUnder(id, false));
     this.completions.add(work);
     try { await work; } finally { this.completions.delete(work); this.changed(); }
   }
@@ -750,7 +795,7 @@ export class Children {
         if (!known || known.window && !known.handoff?.delivered) {
           // Its own ending wins over the `owner-stopped` one a restart gave a record whose window was gone by then.
           if (known && !isActiveRun(known)) delete known.handoff;
-          else await this.adopt(rest, { quiet: true });
+          else await this.adopt(rest, { announce: false });
           await this.endRemote(window.id, reason, text);
         }
         unqueueWindow(this.profileDirectory, window.id);

@@ -1,18 +1,20 @@
 import { chmodSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { INTERRUPTED, type Children } from './agents.ts';
+import { Value } from 'typebox/value';
+import { INTERRUPTED, TASKS, type Children } from './agents.ts';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { record } from './core/cache.ts';
 import { checkPatch, checkSocketPath, isWindows, profileSocket, removeStaleSocket, type ConfigPatch } from './profiles.ts';
 import { textContent } from './transcript.ts';
 import { isActiveRun, isRemoteWindow, type RunInfo } from './runs.ts';
 import { HANDOFF_REQUEST } from './prompts.ts';
-import { connectWindow, isAssistant, wire, type Action, type AttachableAgent, type LiveState, type WindowMessage } from './window-client.ts';
+import { connectWindow, isAssistant, isImportAction, wire, type Action, type ImportAction, type AttachableAgent, type LiveState, type WindowMessage } from './window-client.ts';
 import type { AssistantMessage, UserMessage } from '@earendil-works/pi-ai';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
-/** What a registered window may still ask: its agent and conversation are its own. */
-const REMOTE_ACTIONS: readonly Action[] = ['handoff', 'tell-main'];
+/** What a registered window may still ask: its agent and conversation are its own, its subagents run here. The reply to
+ * `register` lists them, so a window knows what an older owner can't do. */
+const REMOTE_ACTIONS: readonly Action[] = ['handoff', 'tell-main', 'spawn', 'tell', 'models', 'completing'];
 const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
 /** Stays under the 4 MB frame bound even when JSON escapes some characters. */
 const ANSWER_LIMIT = 1_000_000;
@@ -34,9 +36,10 @@ const fits = (value: unknown) => { try { return JSON.stringify(value).length < 1
 
 /** Call only while holding the profile lock. The owner hosts every child session. */
 export async function serveWindows(directory: string, children: Children, available: () => boolean,
-  report: (text: string) => Promise<void>, configure?: (patch: ConfigPatch) => void) {
+  report: (text: string) => Promise<void>, configure?: (patch: ConfigPatch) => void, importer?: (action: ImportAction, selection: string) => Promise<void>) {
   const path = profileSocket(directory, 'windows'); checkSocketPath(path);
   removeStaleSocket(path); // A previous owner can no longer hold the profile lock.
+  const ready = () => { if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready'); };
   const connections = new Set<Socket>();
   const work = new Set<Promise<void>>();
   let closing = false;
@@ -44,6 +47,7 @@ export async function serveWindows(directory: string, children: Children, availa
     if (closing) { socket.destroy(); return; }
     connections.add(socket);
     let child: string | undefined, attached = false, remote = false, cursor = 0, firstUser = true, lastStatus = '';
+    let disconnect: (() => void) | undefined;
     // `finished`: an attached agent ended, and the view takes only `resume`, which the app's client sends (Pi's terminal attach
     // just reads a finished agent), until the agent is live again. `closing`: the view takes nothing more.
     let phase: 'open' | 'finished' | 'closing' = 'open';
@@ -68,14 +72,22 @@ export async function serveWindows(directory: string, children: Children, availa
           } else if (frame.action === 'configure') {
             // Another app's settings change (pi-optchat/files' updateConfig), checked again here and applied as the settings page does.
             if (!configure) throw new Error('This Pi takes no settings changes');
-            if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
+            ready();
             let patch: unknown;
             try { patch = JSON.parse(frame.text ?? ''); } catch { patch = undefined; }
             checkPatch(patch);
             configure(patch);
+          } else if (frame.action === 'resume-cut-off') {
+            // An RPC host's go-ahead for what interactive Pi does at every start (see index.ts).
+            ready();
+            await children.resumeCutOff();
+          } else if (isImportAction(frame.action)) {
+            // Not `ready()`: that refuses while an import is pending or running, which is what a pause, resume or discard is for. The importer has the import's own guards.
+            if (!importer) throw new Error('This Pi takes no imports');
+            await importer(frame.action, frame.text ?? '');
           } else if (frame.action === 'attach') {
             if (child) throw new Error('This window already has a conversation');
-            if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
+            ready();
             const id = frame.text?.trim();
             if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) throw new Error('An exact agent ID is required');
             const info = children.history.records.get(id);
@@ -92,15 +104,19 @@ export async function serveWindows(directory: string, children: Children, availa
             drainMessages(messages, info);
           } else if (frame.action === 'register') {
             if (child) throw new Error('This window already has a conversation');
-            if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
+            ready();
             let window: unknown;
             try { window = JSON.parse(frame.text ?? ''); } catch { window = undefined; }
             if (!isRemoteWindow(window)) throw new Error('Invalid window registration');
             await children.adopt(window);
             child = window.id; remote = true;
+            // Its subagents' reports and messages: the window's agent gets them as it would a report (rpc-window.ts).
+            // Cut to fit a frame: the head names the agent, whose whole chat zoom reads.
+            disconnect = children.connectWindow(child, text => { send({ kind: 'event', name: 'message', text: shorten(text, ANSWER_LIMIT) }); return !socket.destroyed; });
+            send({ kind: 'reply', id: frame.id, text: REMOTE_ACTIONS.join(' ') }); return;
           } else if (frame.action === 'start') {
             if (child) throw new Error('This window already has a conversation');
-            if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
+            ready();
             if (!frame.text?.trim() || !frame.cwd) throw new Error('A request and working directory are required');
             [child] = await children.spawn([{ task: frame.text, cwd: frame.cwd }], frame.cwd, controller.signal, undefined, true);
             if (socket.destroyed) { await children.finish(child, closing ? 'owner-stopped' : 'disconnected'); return; }
@@ -108,7 +124,24 @@ export async function serveWindows(directory: string, children: Children, availa
           } else {
             if (!child) throw new Error('Send your first request to start a conversation');
             if (remote && !REMOTE_ACTIONS.includes(frame.action)) throw new Error('This window runs its own agent');
-            if (!remote && frame.action === 'handoff') throw new Error('Only a window running its own agent hands off');
+            if (!remote && frame.action !== 'tell-main' && REMOTE_ACTIONS.includes(frame.action)) throw new Error(`Only a window running its own agent asks for ${frame.action}`);
+            if (frame.action === 'spawn') {
+              ready();
+              let tasks: unknown;
+              try { tasks = JSON.parse(frame.text ?? ''); } catch { tasks = undefined; }
+              if (!Value.Check(TASKS, tasks) || !frame.cwd) throw new Error('Tasks and a working directory are required');
+              send({ kind: 'reply', id: frame.id, text: await children.start(tasks, frame.cwd, controller.signal, child) }); return;
+            }
+            if (frame.action === 'tell') {
+              ready(); // It may resume a finished child.
+              let tell: unknown;
+              try { tell = JSON.parse(frame.text ?? ''); } catch { tell = undefined; }
+              if (!record(tell) || typeof tell.id !== 'string' || typeof tell.message !== 'string') throw new Error('An agent ID and a message are required');
+              send({ kind: 'reply', id: frame.id, text: await children.guide(child, tell.id, tell.message) }); return;
+            }
+            // /complete has begun: from now on its subagents report to the main chat, as once it has ended.
+            if (frame.action === 'completing') { disconnect?.(); send({ kind: 'reply', id: frame.id }); return; }
+            if (frame.action === 'models') { send({ kind: 'reply', id: frame.id, text: children.models(frame.text || undefined) }); return; }
             if (frame.action === 'handoff') {
               phase = 'closing';
               // Delivered (or saved for the next start) before the reply, so the window queues it if this owner fails it.
@@ -131,7 +164,7 @@ export async function serveWindows(directory: string, children: Children, availa
             if (frame.action === 'resume') {
               // Checked against the agent, not the view, which notices a finish only at its next tick.
               if (!attached || children.live(child)) throw new Error(`Only a finished agent you attached to resumes; ${child} is running, so say reaches it`);
-              if (!available()) throw new Error('Profile is importing or shutting down; try again when it is ready');
+              ready();
               await children.resumeByUser(child, frame.text ?? '');
               phase = 'open'; finalMessages = undefined; // As the next tick would, so a say right after this one is taken.
               send({ kind: 'reply', id: frame.id }); return;
@@ -147,7 +180,7 @@ export async function serveWindows(directory: string, children: Children, availa
             } else {
               if (!frame.text?.trim()) throw new Error('Message is empty');
               if (frame.action === 'say') await children.tell(child, frame.text, 'user');
-              else await report(`[${child}] User message from connected window: ${frame.text}`);
+              else await report(`[${child}] ${frame.from === 'agent' ? 'Connected agent message' : 'User message from connected window'}: ${frame.text}`);
             }
           }
           send({ kind: 'reply', id: frame.id });
@@ -221,7 +254,7 @@ export async function serveWindows(directory: string, children: Children, availa
     const { promise: ended, resolve } = Promise.withResolvers<void>();
     const connection = ended.then(async () => {
       clearInterval(timer); controller.abort(); connections.delete(socket);
-      await queue;
+      await queue; disconnect?.();
       // A window running its own agent outlives this owner: it hands off to whoever owns the profile when it ends.
       if (child && remote) { if (!closing) await children.endRemote(child, 'disconnected'); }
       else if (child && !attached) await children.finish(child, closing ? 'owner-stopped' : 'disconnected');

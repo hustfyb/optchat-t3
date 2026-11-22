@@ -9,7 +9,10 @@ import { createProfile, loadConfig, lockProfile, profilePath, saveConfig } from 
 import { textContent } from '../src/transcript.ts';
 import { ROLE_STATUS, type Role } from '../src/rpc-window.ts';
 import { fixtureProvider, type Sent } from './fixtures/rpc-provider.ts';
+import { connectWindow, type WindowEvent } from '../src/window-client.ts';
 import { removeDir } from './support.ts';
+import { readRuns } from '../src/run-record.ts';
+import { HANDOFF_REQUEST } from '../src/prompts.ts';
 
 // Short paths: the profile's sockets have a ~103-byte limit on macOS.
 const root = mkdtempSync(process.platform === 'win32' ? join(tmpdir(), 'oc-rpcw-') : '/tmp/oc-rpcw-');
@@ -36,11 +39,11 @@ const logged = (name: string) => readdirSync(join(profilePath(name), 'main')).fl
   .map(line => { const entry: unknown = JSON.parse(line); return entry && typeof entry === 'object' && 'text' in entry ? String(entry.text) : ''; });
 
 /** An RPC session on `profile`, as a host like T3 Code starts one per thread. */
-async function rpc(name: string, connect?: string, mode: 'rpc' | 'json' = 'rpc', flag = mode === 'rpc') {
+async function rpc(name: string, connect?: string, mode: 'rpc' | 'json' = 'rpc', flag = mode === 'rpc', hold?: Parameters<typeof fixtureProvider>[1]) {
   const dir = mkdtempSync(join(root, 's-'));
   const sent: Sent[] = [], notes: string[] = [], errors: string[] = [], roles: Role[] = [];
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models.json'), refreshOnCreate: false });
-  runtime.registerProvider('fixture', fixtureProvider(sent));
+  runtime.registerProvider('fixture', fixtureProvider(sent, hold));
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 1 }, cacheWarming: 'off', retry: { enabled: false } });
   const loader = new DefaultResourceLoader({ cwd: dir, agentDir: join(dir, 'agent'), settingsManager,
     noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true, extensionFactories: [optchat] });
@@ -80,6 +83,7 @@ test('an RPC session on a busy profile joins as a connected window: its own agen
   const window = await rpc(name);
   try {
     assert.deepEqual(owner.role(), { role: 'owner', profile: name });
+    assert.ok(!owner.notes.some(note => note.includes(' messages\nCompactor:')), 'no start banner for an RPC host, which shows the profile itself');
     await owner.ask('The colour is teal.');
     const id = window.role()?.role === 'window' ? window.role() : undefined;
     assert.deepEqual({ ...id, id: undefined }, { role: 'window', profile: name, id: undefined, connected: true, completed: false });
@@ -94,11 +98,16 @@ test('an RPC session on a busy profile joins as a connected window: its own agen
     const [request] = window.sent;
     assert.match(request.system, /You are a connected window of OptChat/);
     assert.match(request.messages.join('\n'), /The colour is teal\./, 'the view, read from disk, comes with the request');
-    assert.ok(!window.sent.some(s => s.system.includes('"spawn"')) && !window.session.getActiveToolNames().includes('spawn'), 'a window delegates nothing');
+    assert.ok(window.session.getActiveToolNames().includes('spawn'), 'a window delegates through the owner');
     assert.ok(window.session.getActiveToolNames().includes('zoom'));
-    // The owner's agent is told about the window (a turn that changes the view), and summarizes that long report.
-    await until(() => owner.sent.some(s => s.last.includes('User started a connected conversation')) && !owner.session.isStreaming);
+    // The owner's agent is told about the window on its next turn, without a turn of its own; that changes the view.
+    const pending = () => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8');
+    await until(() => pending().includes('User started a connected conversation') || owner.sent.length > calls);
     await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(owner.sent.length, calls, 'a window\'s first message wakes no main agent turn');
+    await owner.ask('Anything new?');
+    assert.match(owner.sent.at(-1)!.messages.join('\n'), /User started a connected conversation/);
+    assert.equal(logged(name).filter(text => /^\[\w+\] User started a connected conversation/.test(text)).length, 1, 'logged once');
     await window.ask('And the size?');
     const moved = window.sent[1].messages, at = moved.findIndex(m => m.includes('<chat>'));
     assert.ok(at > 0 && moved[at].includes('And the size?'), 'a changed view moves to the newest request');
@@ -135,13 +144,52 @@ test('an RPC session on a busy profile joins as a connected window: its own agen
     assert.match(window.sent.at(-1)!.messages[0], /<chat>/, 'and the view on its request');
     assert.deepEqual(window.errors, []);
     assertBoundary(window);
-    await until(() => owner.sent.some(s => s.last.includes(`[${next.id}] User started a connected conversation`)));
+    await until(() => pending().includes(`[${next.id}] User started a connected conversation`));
     // Closed without /complete: the compactor gets this conversation's transcript only, not the completed one before it.
     await window.close();
     await until(() => owner.sent.some(s => s.last.includes(`[${next.id}] Connected conversation interrupted`)));
     const summarized = owner.sent.find(s => s.system.includes('handoff') && s.last.includes('Next topic?'))?.last ?? '';
     assert.ok(summarized && !summarized.includes('What colour?'), 'only its own conversation is summarized');
+    // Ended before the main agent took a turn: its handoff starts that turn, and the start Pi held for it still comes first.
+    await until(() => !owner.session.isStreaming && logged(name).some(text => text.startsWith(`[${next.id}] Connected conversation interrupted`)));
+    assert.deepEqual(logged(name).filter(text => text.startsWith(`[${next.id}]`)).map(text => text.split(' ')[1]), ['User', 'Connected'], 'memory has the start, then the handoff');
+    const turn = owner.sent.find(s => !s.last.startsWith('Compaction:') && s.messages.some(m => m.includes(`[${next.id}] User started`)))!;
+    assert.match(turn.last, /Connected conversation interrupted/, 'and the model reads the handoff last');
   } finally { await window.close(); await owner.close(); }
+});
+
+test('a terminal window\'s first message, like an RPC window\'s, reaches the main agent on its next turn without one of its own', async () => {
+  const name = profile(), owner = await rpc(name), events: WindowEvent[][] = [[], []];
+  const clients = await Promise.all(events.map(list => connectWindow(profilePath(name), event => list.push(event), () => {})));
+  try {
+    for (const [i, task] of ['Count the files.', 'List the tests.'].entries()) {
+      await clients[i].request('start', task, root);
+      await until(() => events[i].some(e => e.name === 'message' && e.from === 'agent'));
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.ok(!owner.sent.some(s => s.messages.some(m => m.includes('User started'))), 'no main agent turn');
+    await owner.ask('Anything new?');
+    assert.match(owner.sent.at(-1)!.messages.join('\n'), /User started a connected conversation in/);
+    const starts = logged(name).filter(text => text.includes('User started')).map(text => text.match(/Initial message: (.*)/)?.[1]);
+    assert.deepEqual(starts, ['Count the files.', 'List the tests.'], 'after the user\'s message, in the order the windows started');
+  } finally { for (const client of clients) client.close(); await owner.close(); }
+});
+
+test('a window that starts and ends while the main agent works: its start still comes before its handoff', async () => {
+  let release = () => {};
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const name = profile(), owner = await rpc(name, undefined, 'rpc', true, request => request === 'Work on.' ? held : undefined), window = await rpc(name);
+  try {
+    const working = owner.ask('Work on.');
+    await until(() => owner.sent.some(s => s.last === 'Work on.'));
+    await window.ask('Quick question?');
+    const role = window.role(), id = role?.role === 'window' ? role.id : undefined;
+    await window.ask('/complete');
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes('completed by user'));
+    release(); await working;
+    await owner.ask('Anything new?');
+    assert.deepEqual(logged(name).filter(text => text.startsWith(`[${id}]`)).map(text => text.split(' ')[1]), ['User', 'Connected'], 'the start, then the handoff');
+  } finally { release(); await window.close(); await owner.close(); }
 });
 
 test('a window that completes and then closes is handed off once', async () => {
@@ -162,10 +210,15 @@ test('a window that completes and then closes is handed off once', async () => {
 test('a completed window\'s session resumed in a new process starts a new conversation without the completed one', async () => {
   const name = profile(), owner = await rpc(name), window = await rpc(name);
   try {
+    // Later, as a host resumes a thread: once the owner has the closed conversation's handoff and is done with it. Before that its
+    // lock may answer the resumed window too late on a slow machine (they share this process), which then refuses to open.
+    const handedOff = () => { const role = window.role(), id = role?.role === 'window' ? role.id : '';
+      return until(() => logged(name).some(text => text.includes(`[${id}] Connected conversation`) && !text.startsWith('Reply:')) && !owner.session.isStreaming); };
     await window.ask('First topic.');
     await window.ask('/complete');
     // The host released the process and resumes the thread later: Pi closes the session, then starts it again from its file.
     await window.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+    await handedOff();
     await window.session.extensionRunner.emit({ type: 'session_start', reason: 'resume' });
     const role = window.role();
     assert.ok(role?.role === 'window' && !role.completed);
@@ -178,7 +231,9 @@ test('a completed window\'s session resumed in a new process starts a new conver
     const first = window.session.sessionManager.getEntries().find(e => e.type === 'message' && e.message.role === 'assistant');
     window.session.sessionManager.branch(first!.id);
     await window.session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+    await handedOff();
     await window.session.extensionRunner.emit({ type: 'session_start', reason: 'resume' });
+    assert.deepEqual(window.errors, []);
     await window.ask('Back again.');
     assert.equal(window.sent.at(-1)!.messages.length, 3, 'its request, the reply, then the new one');
   } finally { await window.close(); await owner.close(); }
@@ -292,6 +347,8 @@ test('a window registered with an owner that closed queues its /complete, and th
     const report = owner.sent.find(s => s.last.includes(`[${id}] Connected conversation`))!.last;
     assert.match(report, /completed by user/, 'the window\'s own ending, not the restart\'s');
     assert.match(report, /Handoff: the user asked about the colour/);
+    await until(() => !owner.session.isStreaming && logged(name).some(text => text.startsWith(`[${id}] Connected`)));
+    assert.deepEqual(logged(name).filter(text => text.startsWith(`[${id}]`)).map(text => text.split(' ')[1]), ['User', 'Connected'], 'the start the last owner saved, then the handoff');
   } finally { await owner.close(); }
 });
 
@@ -303,7 +360,7 @@ test('an idle window registers with an owner that opens later, which then hands 
   const owner = await rpc(name);
   try {
     await until(() => { const role = window.role(); return role?.role === 'window' && role.connected; });
-    await until(() => owner.sent.some(s => s.last.includes('User started a connected conversation')));
+    await until(() => readFileSync(join(profilePath(name), 'pending-reports.json'), 'utf8').includes('User started a connected conversation'));
     // Registered, it leaves the queue.
     await until(() => readdirSync(join(profilePath(name), 'remote-windows')).length === 0);
     await window.close();
@@ -317,4 +374,77 @@ test('a window on a missing profile is refused, and nothing is created', async (
     assert.match(missing.errors[0] ?? '', /does not exist/);
     assert.equal(existsSync(profilePath('nope')), false);
   } finally { await missing.close(); }
+});
+
+test('a window\'s spawn starts its subagents on the owner, as their parent: their reports reach the window, and once it has ended the main chat', async () => {
+  const name = profile();
+  let release = () => {};
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const owner = await rpc(name, undefined, 'rpc', true, request => request.endsWith('slow work') ? held : undefined);
+  const window = await rpc(name);
+  const spawn = (task: string) => `CALL spawn ${JSON.stringify({ tasks: [{ task }] })}`;
+  try {
+    await window.ask(spawn('quick work'));
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    const [quick] = readRuns(profilePath(name)).filter(run => run.task === 'quick work');
+    assert.equal(quick?.parentId, id, 'the window is its parent, in the owner\'s records');
+    await until(() => window.sent.some(s => s.last.startsWith(`[${quick.id}] Reply:`)));
+    assert.ok(!owner.sent.some(s => s.last.includes(`[${quick.id}]`)), 'the report went to the window, not the main chat');
+
+    await window.ask(spawn('slow work'));
+    const [slow] = readRuns(profilePath(name)).filter(run => run.task === 'slow work');
+    await window.close();
+    await until(() => readRuns(profilePath(name)).find(run => run.id === id)?.state === 'interrupted');
+    release();
+    await until(() => owner.sent.some(s => s.last.includes(`[${slow.id}] Reply:`)));
+    assert.match(owner.sent.find(s => s.last.includes(`[${slow.id}] Reply:`))!.last, new RegExp(`For connected window ${id}, which has ended`));
+    assert.ok(!window.sent.some(s => s.last.includes(`[${slow.id}]`)));
+  } finally { release(); await window.close(); await owner.close(); }
+});
+
+test('a window\'s agent messages the main agent with tell_main, which only a window has', async () => {
+  const name = profile(), owner = await rpc(name), window = await rpc(name);
+  try {
+    assert.equal(await window.ask(`CALL tell_main ${JSON.stringify({ message: 'We are on BACK-1.' })}`), 'Reply: Message sent to the main agent.');
+    const role = window.role(), id = role?.role === 'window' ? role.id : '';
+    // It wakes the main agent, which reads it as the window agent's, not the user's.
+    await until(() => owner.sent.some(s => s.messages.some(m => m.includes(`[${id}] Connected agent message: We are on BACK-1.`))));
+    assert.ok(!owner.session.getActiveToolNames().includes('tell_main'), 'the main chat has no main to tell');
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('a window\'s spawn with no owner to reach fails and says so', async () => {
+  const name = profile(), owner = await rpc(name), window = await rpc(name);
+  try {
+    await window.ask('Hello');
+    await owner.close();
+    await until(() => { const role = window.role(); return role?.role === "window" && !role.connected; });
+    assert.match(await window.ask(`CALL spawn ${JSON.stringify({ tasks: [{ task: 'work' }] })}`) ?? '', /^Reply: No main window is reachable/);
+  } finally { await window.close(); await owner.close(); }
+});
+
+test('a report for a window that is writing its handoff goes to the main chat, not into the handoff turn', async () => {
+  const name = profile();
+  let releaseChild = () => {}, releaseHandoff = () => {};
+  const child = new Promise<void>(resolve => { releaseChild = resolve; }), handoff = new Promise<void>(resolve => { releaseHandoff = resolve; });
+  const owner = await rpc(name, undefined, 'rpc', true, request => request.endsWith('late work') ? child : undefined);
+  const window = await rpc(name, undefined, 'rpc', true, request => request.startsWith(HANDOFF_REQUEST) ? handoff : undefined);
+  try {
+    await window.ask(`CALL spawn ${JSON.stringify({ tasks: [{ task: 'late work' }] })}`);
+    const [late] = readRuns(profilePath(name)).filter(run => run.task === 'late work');
+    const completing = window.ask('/complete');
+    await until(() => window.sent.some(s => s.last.startsWith(HANDOFF_REQUEST)));
+    releaseChild();
+    await until(() => readRuns(profilePath(name)).find(run => run.id === late.id)?.state === 'completed');
+    await new Promise(resolve => setTimeout(resolve, 200)); // The report is on its way to the window.
+    releaseHandoff();
+    await completing;
+    const handoffOf = (s: { last: string }) => /^\[\w+\] Connected conversation completed by user/.test(s.last);
+    await until(() => owner.sent.some(handoffOf));
+    const delivered = owner.sent.find(handoffOf)!.last;
+    assert.match(delivered, /Handoff: the user asked about the colour/, 'the handoff is the window\'s answer to the handoff request');
+    assert.doesNotMatch(delivered, new RegExp(`\\[${late.id}\\] Reply`));
+    await until(() => owner.sent.some(s => s.last.startsWith(`[${late.id}] Reply:`)));
+    assert.match(owner.sent.find(s => s.last.startsWith(`[${late.id}] Reply:`))!.last, /which has ended/, 'an ordinary report, saying whose it was');
+  } finally { releaseChild(); releaseHandoff(); await window.close(); await owner.close(); }
 });

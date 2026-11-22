@@ -261,15 +261,17 @@ export default function optchat(pi: ExtensionAPI) {
     if (!name) return undefined;
     createProfile(name); return name;
   };
-  // `--optchat-profile auto` names a profile after the session, for hosts that run many sessions in one
-  // process and cannot set a profile per thread (T3 Code). The session id keeps the name stable across
-  // resumes; the directory keeps it readable. It is created on first use with the model the session runs.
-  // A session the host does not persist (`--no-session`) has neither: see the guard in session_start.
+  // `--optchat-profile auto` names a profile after the project (the working directory), for hosts that run many
+  // sessions in one process and cannot set a profile per thread (T3 Code). Every thread the host opens in that
+  // project resolves to the same name, so they share one memory: the first is the owner, the rest join it as
+  // connected windows (`--optchat-connect auto`). It is created on first use with the model the session runs.
+  // A session the host does not persist (`--no-session`) has no working session to name, so it stays plain Pi:
+  // see the guard in session_start.
   const sessionPersisted = (ctx: ExtensionContext) => {
     const manager = ctx.sessionManager as { isPersisted?: () => boolean };
     return typeof manager.isPersisted === 'function' ? manager.isPersisted() : true;
   };
-  const autoProfile = (ctx: ExtensionContext) => sessionPersisted(ctx) ? autoProfileName(ctx.cwd, ctx.sessionManager.getSessionId()) : undefined;
+  const autoProfile = (ctx: ExtensionContext) => sessionPersisted(ctx) ? autoProfileName(ctx.cwd) : undefined;
   // An unbound TUI session skips the picker when the choice is clear (#238): /new keeps the window's profile, then OPTCHAT_PROFILE, then a lone profile.
   const defaultProfile = (ctx: ExtensionContext, event: SessionStartEvent): string | undefined => {
     if (ctx.mode !== 'tui') return undefined;

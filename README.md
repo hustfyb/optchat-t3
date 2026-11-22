@@ -2,11 +2,11 @@
 
 # optchat-t3
 
-> **Fork of [pi-optchat](https://github.com/jonaslsaa/pi-optchat).** It adds per-session profiles for
-> [T3 Code](docs/t3-code.md) (`--optchat-profile auto`: one profile per thread, named after the session id's
-> first and last twelve characters, and none for the `--no-session` runs T3 uses for its provider probe and
-> one-off generation) and the fixes for T3 replacing the session under a running extension. Everything else is
-> upstream 0.11.13.
+> **Fork of [pi-optchat](https://github.com/jonaslsaa/pi-optchat).** It adds per-project profiles for
+> [T3 Code](docs/t3-code.md) (`--optchat-profile auto`: one profile per project directory, shared by every
+> thread opened in it — the first is the owner, the rest join as connected windows — and none for the
+> `--no-session` runs T3 uses for its provider probe and one-off generation) and the fixes for T3 replacing
+> the session under a running extension. Everything else is upstream 0.12.4.
 
 A Pi extension that gives you one endless chat per profile, remembered through a summary tree instead of compaction. It implements [Victor Taelin's OptChat recipe](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449).
 

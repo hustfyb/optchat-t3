@@ -219,15 +219,15 @@ test('--optchat-agent refuses headless mode without opening a profile or answeri
   }
 });
 
-test('--optchat-profile auto names the profile after the session and creates it from the session model', async () => {
+test('--optchat-profile auto names the profile after the project and creates it from the session model', async () => {
   const pi = await headless('rpc', { flag: 'auto' });
   try {
     assert.match(await pi.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the prompt runs with the OptChat view');
     const [binding, ...rest] = pi.bindings();
     assert.equal(rest.length, 0, 'one binding');
-    const id = pi.sessionId.replace(/[^a-z0-9]/gi, '').toLowerCase();
-    assert.equal(String((binding as { name?: string } | undefined)?.name), `t3-${basename(pi.dir).toLowerCase()}-${id.slice(0, 12)}${id.slice(-12)}`,
-      'the name is the directory slug plus both ends of the session id, so two sessions never share one');
+    const slug = basename(pi.dir).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
+    assert.equal(String((binding as { name?: string } | undefined)?.name), `t3-${slug}`,
+      'the name is the project directory, so every thread in that project shares one profile');
     const name = (binding as { name: string }).name, dir = profilePath(name);
     assert.ok(existsSync(join(dir, 'AGENTS.md')), 'the profile is complete, so /optchat instructions works');
     const config = loadConfig(dir);
@@ -239,26 +239,29 @@ test('--optchat-profile auto names the profile after the session and creates it 
   } finally { await pi.close(); }
 });
 
-test('--optchat-profile auto gives two sessions whose ids share their first 8 characters different profiles', async () => {
-  // T3 Code opens threads in bursts. UUIDv7 ids started inside one 65.5 s window share their first 8 characters,
-  // so the shortened name gave them one profile, and the second session died on the first one's lock.
-  const first = await headless('rpc', { flag: 'auto', sessionId: '01a19227-2f21-7c00-8000-000000000001' });
-  const second = await headless('rpc', { flag: 'auto', sessionId: '01a19227-2f45-7c00-8000-000000000002' });
+test('--optchat-profile auto gives every thread in one project the same profile, so they share one memory', async () => {
+  // T3 Code opens many threads in one project. Each now resolves to the same name, so a later thread comes to the
+  // memory the earlier ones wrote (the first owner, the rest connected windows). A per-thread name kept them apart.
+  const project = mkdtempSync(join(root, 'proj-'));
+  const first = await headless('rpc', { flag: 'auto', cwd: project, sessionId: '01a19227-2f21-7c00-8000-000000000001' });
+  let firstName = '';
   try {
-    assert.match(await first.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the first session runs with its own memory');
-    assert.match(await second.ask('Say OK') ?? '', /^OK to: <chat>[^]*Say OK$/, 'the second session runs with its own memory too');
-    assert.deepEqual(first.errors, [], 'the first session was not taken down');
-    assert.deepEqual(second.errors, [], 'the second session did not meet the first one\'s lock');
-    const names = [first, second].map(pi => (pi.bindings()[0] as { name?: string } | undefined)?.name);
-    assert.ok(names[0] && names[1], 'both sessions saved a binding');
-    assert.notEqual(names[0], names[1], 'the two sessions name different profiles');
-    for (const name of names) assert.ok(existsSync(join(profilePath(String(name)), 'AGENTS.md')), `${name} exists`);
-  } finally { await first.close(); await second.close(); }
+    assert.match(await first.ask('remember 7319') ?? '', /^OK to: <chat>[^]*remember 7319$/, 'the first thread runs with its memory');
+    firstName = String((first.bindings()[0] as { name?: string } | undefined)?.name);
+    assert.ok(existsSync(join(profilePath(firstName), 'AGENTS.md')), `${firstName} exists`);
+    assert.deepEqual(first.errors, []);
+  } finally { await first.close(); }
+  const second = await headless('rpc', { flag: 'auto', cwd: project, sessionId: '01a19227-2f45-7c00-8000-000000000002' });
+  try {
+    assert.equal(String((second.bindings()[0] as { name?: string } | undefined)?.name), firstName, 'the second thread names the same profile');
+    assert.match(await second.ask('what did I say') ?? '', /7319/, 'the second thread reads what the first wrote');
+    assert.deepEqual(second.errors, []);
+  } finally { await second.close(); }
 });
 
 test('--optchat-profile auto with --no-session creates no profile and runs as plain Pi', async () => {
-  // T3 Code starts its provider probe and one-off text generation with --no-session; a profile named after the
-  // throwaway session id can never be resumed, so it was only an empty directory left behind on every run.
+  // T3 Code starts its provider probe and one-off text generation with --no-session; a run with no working
+  // session has no project to share a memory with, so naming one only left an empty directory behind on every run.
   const before = listProfiles();
   for (const mode of ['print', 'rpc'] as const) {
     const pi = await headless(mode, { flag: 'auto', ephemeral: true });
@@ -274,7 +277,7 @@ test('--optchat-profile auto with --no-session creates no profile and runs as pl
 
 test('a profile another host creates during startup surfaces as its lock owner, not as EEXIST', async () => {
   const dir = mkdtempSync(join(root, 'race-')), id = '01a19227-2f21-7c00-8000-000000000001';
-  const name = autoProfileName(dir, id)!, target = profilePath(name);
+  const name = autoProfileName(dir)!, target = profilePath(name);
   createProfile(name);
   const unlock = await lockProfile(target, `${name} · PID 1 · elsewhere`);
   const original = fs.existsSync, seen = { n: 0 };

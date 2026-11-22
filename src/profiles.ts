@@ -29,18 +29,15 @@ export function profilePath(name: string, home = dataHome()) {
   return join(home, 'profiles', name);
 }
 /**
- * The profile name `--optchat-profile auto` derives from a host session: the working directory keeps it readable, the
- * session id keeps it stable across resumes. UUIDv7 session ids (T3 Code) begin with the millisecond timestamp and put
- * their randomness at the end, so both ends are kept: eight characters kept only the timestamp's high bits, which gave
- * every session started inside the same 65.5 s window one profile name. Twenty-four characters stay unique per session
- * and keep the name, and the lock socket built from it, inside their length limits.
+ * The profile name `--optchat-profile auto` derives from a host session: one profile per project, the working
+ * directory's last 16 characters keeping it readable. Being stable across threads and resumes, every thread a host
+ * opens in that project comes to the same memory. Threads of one project that run at once meet as the profile's
+ * owner and its connected windows (`--optchat-connect auto`, the default), not as a lock failure; a session that
+ * already carries an `optchat.profile` binding keeps it, so old per-thread profiles keep their own memory.
  */
-export function autoProfileName(cwd: string, sessionId: string | undefined) {
-  const id = typeof sessionId === 'string' ? sessionId.replace(/[^a-z0-9]/gi, '').toLowerCase() : '';
-  const unique = id.length > 24 ? `${id.slice(0, 12)}${id.slice(-12)}` : id;
-  if (unique.length < 6) return undefined;
+export function autoProfileName(cwd: string) {
   const slug = basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(-16) || 'root';
-  return `t3-${slug}-${unique}`;
+  return `t3-${slug}`;
 }
 export function listProfiles(home = dataHome()) {
   const root = join(home, 'profiles');
